@@ -29,6 +29,17 @@ import java.lang.annotation.Target;
  * every annotated method (mixed prefixes require the option). Its package is the {@code nativebind.package}
  * option, or the common package of every annotated class. It gets a {@code @CHeader} only if all annotated
  * classes agree on one.
+ * <p>
+ * The same class exports functions for working with handles to commonly returned types, each named
+ * {@code <prefix><Name>} and taking the {@code IsolateThread} first:
+ * <ul>
+ *     <li>{@code CompletableFuture} / {@code Future}: {@code futureIsDone}, {@code futureAwait(future, timeoutMillis)},
+ *     {@code futureGet}, {@code futureError}, {@code futureCancel}, and {@code futureOnComplete(future, callback,
+ *     userData)}, which calls {@code void callback(graal_isolatethread_t *, void *userData)} on completion</li>
+ *     <li>values: {@code handleToString}, {@code stringToHandle}, {@code unboxBoolean}, {@code unboxLong},
+ *     {@code unboxDouble}</li>
+ *     <li>containers: {@code collectionSize}, {@code listGet}, {@code mapKeys}, {@code mapGet}, {@code optionalGet}</li>
+ * </ul>
  */
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.SOURCE)

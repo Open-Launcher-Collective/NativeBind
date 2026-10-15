@@ -6,7 +6,7 @@
 
     <groupId>me.judge</groupId>
     <artifactId>NativeBind</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <version>0.1-SNAPSHOT</version>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
@@ -58,7 +58,6 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.14.0</version>
                 <configuration>
-                    <!-- JDK 23+ no longer discovers processors from the classpath -->
                     <annotationProcessorPaths>
                         <path>
                             <groupId>com.google.auto.service</groupId>

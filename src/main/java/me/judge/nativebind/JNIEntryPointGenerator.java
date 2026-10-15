@@ -105,7 +105,8 @@ final class JNIEntryPointGenerator {
     record Entry(ExecutableElement method, String symbol, Signature signature) {
     }
 
-    record SupportSymbols(String createIsolate, String tearDownIsolate, String releaseHandle) {
+    /** {@code builtins} maps each {@link Builtins.Builtin} name to its exported symbol. */
+    record SupportSymbols(String createIsolate, String tearDownIsolate, String releaseHandle, Map<String, String> builtins) {
     }
 
     private final Elements elements;
@@ -249,6 +250,44 @@ final class JNIEntryPointGenerator {
                         "Tears down the isolate owning {@code isolateThread}; returns 0 on success.\n"),
                 new JvmNative("releaseHandle", List.of(TypeName.LONG, TypeName.LONG), List.of("handle", "isolateThread"), TypeName.VOID, "JJ", "V",
                         "Releases a handle returned by a native method, allowing its object to be collected. Null handles are ignored.\n"));
+    }
+
+    /** The native methods backed by {@link Builtins}; unlike {@link #supportNatives()}, a hand-written class may omit them. */
+    static List<JvmNative> builtinNatives() {
+        List<JvmNative> natives = new ArrayList<>();
+        for (Builtins.Builtin builtin : Builtins.ALL) {
+            List<TypeName> paramTypes = new ArrayList<>();
+            List<String> paramNames = new ArrayList<>();
+            StringBuilder descriptor = new StringBuilder();
+            for (Builtins.Param param : builtin.params()) {
+                paramTypes.add(jvmType(param.type()));
+                paramNames.add(param.name());
+                descriptor.append(descriptor(jvmType(param.type())));
+            }
+            paramTypes.add(TypeName.LONG);
+            paramNames.add("isolateThread");
+            descriptor.append('J');
+
+            String javadoc = builtin.doc() + "\n";
+            if (builtin.returns() == Builtins.Type.HANDLE) {
+                javadoc += "The returned handle must be passed to {@code releaseHandle} once it is no longer needed.\n";
+            }
+            TypeName returns = jvmType(builtin.returns());
+            natives.add(new JvmNative(builtin.name(), paramTypes, paramNames, returns, descriptor.toString(), descriptor(returns), javadoc));
+        }
+        return natives;
+    }
+
+    private static TypeName jvmType(Builtins.Type type) {
+        return type == Builtins.Type.HANDLE ? TypeName.LONG : type.javaType;
+    }
+
+    private static TypeName nativeType(Builtins.Type type) {
+        return switch (type) {
+            case HANDLE -> OBJECT_HANDLE;
+            case STRING -> JSTRING;
+            default -> type.javaType;
+        };
     }
 
     JavaFile generate(TypeElement owner, List<Entry> entries) {
@@ -485,7 +524,50 @@ final class JNIEntryPointGenerator {
                 .endControlFlow()
                 .build());
 
+        for (Builtins.Builtin builtin : Builtins.ALL) {
+            clazz.addMethod(builtin(builtin, symbols.builtins().get(builtin.name())));
+            clazz.addMethod(builtin.impl());
+        }
+        clazz.addMethod(Builtins.describe());
+        addHelpers(clazz, EnumSet.of(Kind.HANDLE), EnumSet.of(Kind.HANDLE));
+        clazz.addMethod(throwInJvm());
         return JavaFile.builder(packageName, clazz.build()).skipJavaLangImports(true).build();
+    }
+
+    /** Wraps a builtin's logic in an entry point, the same way {@link #wrapper} wraps an annotated method. */
+    private static MethodSpec builtin(Builtins.Builtin builtin, String symbol) {
+        MethodSpec.Builder method = MethodSpec.methodBuilder(builtin.name())
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                .addAnnotation(AnnotationSpec.builder(C_ENTRY_POINT).addMember("name", "$S", symbol).build())
+                .returns(nativeType(builtin.returns()))
+                .addParameter(JNI_ENV, "env")
+                .addParameter(JCLASS, "clazz");
+        List<CodeBlock> args = new ArrayList<>();
+        for (Builtins.Param param : builtin.params()) {
+            method.addParameter(nativeType(param.type()), param.name());
+            args.add(switch (param.type()) {
+                case HANDLE -> CodeBlock.of("$N($N)", FROM_HANDLE, param.name());
+                case STRING -> CodeBlock.of("$T.createString(env, $N)", JNI_UTIL, param.name());
+                default -> CodeBlock.of("$N", param.name());
+            });
+        }
+        method.addParameter(ParameterSpec.builder(ISOLATE_THREAD, "isolateThread").addAnnotation(ISOLATE_THREAD_CONTEXT).build());
+
+        CodeBlock call = CodeBlock.of("$N($L)", builtin.implName(), CodeBlock.join(args, ", "));
+        method.beginControlFlow("try ($T $N = new $T($S, env))", JNI_METHOD_SCOPE, SCOPE, JNI_METHOD_SCOPE, "NativeBind." + builtin.name());
+        method.addStatement("return $L", switch (builtin.returns()) {
+            case HANDLE -> CodeBlock.of("$N($L)", TO_HANDLE, call);
+            case STRING -> CodeBlock.of("$T.createHSString(env, $L)", JNI_UTIL, call);
+            default -> call;
+        });
+        method.nextControlFlow("catch ($T $N)", Throwable.class, ERROR)
+                .addStatement("$N(env, $N)", THROW_IN_JVM, ERROR);
+        method.addStatement("return $L", switch (builtin.returns()) {
+            case HANDLE, STRING -> CodeBlock.of("$T.zero()", WORD_FACTORY);
+            case BOOLEAN -> CodeBlock.of("false");
+            default -> CodeBlock.of("0");
+        });
+        return method.endControlFlow().build();
     }
 
     /**

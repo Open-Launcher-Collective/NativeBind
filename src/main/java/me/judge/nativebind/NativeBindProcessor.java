@@ -211,6 +211,7 @@ public class NativeBindProcessor extends AbstractProcessor {
             if (supportJvmClass != null && supportPackage != null) {
                 List<DeclaredNative> natives = new ArrayList<>();
                 JNIEntryPointGenerator.supportNatives().forEach(n -> natives.add(new DeclaredNative(n, null)));
+                JNIEntryPointGenerator.builtinNatives().forEach(n -> natives.add(new DeclaredNative(n, null)));
                 natives.addAll(byJvmClass.getOrDefault(supportJvmClass, List.of()));
                 byJvmClass.put(supportJvmClass, natives);
             } else {
@@ -220,6 +221,8 @@ public class NativeBindProcessor extends AbstractProcessor {
 
         Map<ExecutableElement, String> symbols = new HashMap<>();
         Map<String, String> supportSymbols = new HashMap<>();
+        Set<String> builtinNames = new HashSet<>();
+        JNIEntryPointGenerator.builtinNatives().forEach(n -> builtinNames.add(n.name()));
         byJvmClass.forEach((jvmClass, natives) -> {
             TypeElement existing = generateJvmClasses ? null : processingEnv.getElementUtils().getTypeElement(jvmClass.replace('$', '.'));
             Element anyOrigin = natives.stream().map(DeclaredNative::method).filter(m -> m != null).findFirst().orElse(null);
@@ -237,12 +240,11 @@ public class NativeBindProcessor extends AbstractProcessor {
                 return;
             }
 
+            Map<String, Set<String>> existingDescriptors = existing == null ? Map.of() : generator.nativeDescriptors(existing);
             Map<String, Set<String>> descriptorsByName = new HashMap<>();
             natives.forEach(n -> descriptorsByName.computeIfAbsent(n.jvmNative().name(), k -> new HashSet<>()).add(n.jvmNative().descriptor()));
-            if (existing != null) {
-                generator.nativeDescriptors(existing).forEach((name, descriptors) ->
-                        descriptorsByName.computeIfAbsent(name, k -> new HashSet<>()).addAll(descriptors));
-            }
+            existingDescriptors.forEach((name, descriptors) ->
+                    descriptorsByName.computeIfAbsent(name, k -> new HashSet<>()).addAll(descriptors));
 
             Set<String> seen = new HashSet<>();
             List<JNIEntryPointGenerator.JvmNative> accepted = new ArrayList<>();
@@ -265,7 +267,10 @@ public class NativeBindProcessor extends AbstractProcessor {
                 } else if (export(symbol, method, "; set @GenerateJNIWrapper(name = ...) to disambiguate")) {
                     symbols.put(method, symbol);
                 }
-                if (existing != null) {
+                // A hand-written class only needs the builtins it wants to call
+                boolean optional = method == null && builtinNames.contains(jvmNative.name())
+                        && !existingDescriptors.containsKey(jvmNative.name());
+                if (existing != null && !optional) {
                     String problem = generator.verify(existing, jvmNative);
                     if (problem != null) {
                         error(origin, problem);
@@ -278,9 +283,10 @@ public class NativeBindProcessor extends AbstractProcessor {
             }
         });
 
-        if (supportJvmClass != null && supportSymbols.size() == 3) {
+        if (supportJvmClass != null && supportSymbols.size() == JNIEntryPointGenerator.supportNatives().size() + builtinNames.size()) {
             JNIEntryPointGenerator.SupportSymbols support = new JNIEntryPointGenerator.SupportSymbols(
-                    supportSymbols.get("createIsolate"), supportSymbols.get("tearDownIsolate"), supportSymbols.get("releaseHandle"));
+                    supportSymbols.get("createIsolate"), supportSymbols.get("tearDownIsolate"), supportSymbols.get("releaseHandle"),
+                    supportSymbols);
             write(generator.generateSupport(supportPackage, support, owners), null);
             write(generator.generateFeature(supportPackage, owners), null);
             write(generator.generateBridgeSupport(supportPackage, owners), null);
@@ -355,11 +361,18 @@ public class NativeBindProcessor extends AbstractProcessor {
         }
         AnnotationMirror header = headers.size() == 1 ? headers.values().iterator().next() : null;
 
+        Map<String, String> builtins = new LinkedHashMap<>();
+        for (String name : CEntryPointGenerator.builtinNames()) {
+            builtins.put(name, CNames.join(prefix, name));
+        }
         CEntryPointGenerator.SupportSymbols symbols = new CEntryPointGenerator.SupportSymbols(
                 CNames.join(prefix, "createIsolate"),
                 CNames.join(prefix, "tearDownIsolate"),
-                CNames.join(prefix, "releaseHandle"));
-        for (String symbol : List.of(symbols.createIsolate(), symbols.tearDownIsolate(), symbols.releaseHandle())) {
+                CNames.join(prefix, "releaseHandle"),
+                builtins);
+        List<String> supportSymbols = new ArrayList<>(List.of(symbols.createIsolate(), symbols.tearDownIsolate(), symbols.releaseHandle()));
+        supportSymbols.addAll(builtins.values());
+        for (String symbol : supportSymbols) {
             exportedSymbols.put(symbol, packageName.isEmpty()
                     ? CEntryPointGenerator.SUPPORT_CLASS
                     : packageName + "." + CEntryPointGenerator.SUPPORT_CLASS);

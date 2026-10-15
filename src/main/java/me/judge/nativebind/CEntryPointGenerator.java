@@ -27,7 +27,9 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletionStage;
 
 /**
  * Generates {@code @CEntryPoint} wrappers that take and return plain C types, in the style of a hand-written
@@ -54,6 +56,12 @@ final class CEntryPointGenerator {
     private static final String TO_C_STRING = "nativeBind$toCString";
     private static final String FROM_HANDLE = "nativeBind$fromHandle";
     private static final String TO_HANDLE = "nativeBind$toHandle";
+    static final String FUTURE_ON_COMPLETE = "futureOnComplete";
+    private static final String FUTURE_CALLBACK = "FutureCallback";
+    private static final ClassName C_FUNCTION_POINTER = ClassName.get("org.graalvm.nativeimage.c.function", "CFunctionPointer");
+    private static final ClassName INVOKE_C_FUNCTION_POINTER = ClassName.get("org.graalvm.nativeimage.c.function", "InvokeCFunctionPointer");
+    private static final ClassName VOID_POINTER = ClassName.get("org.graalvm.nativeimage.c.type", "VoidPointer");
+    private static final ClassName CURRENT_ISOLATE = ClassName.get("org.graalvm.nativeimage", "CurrentIsolate");
 
     /** How a Java value crosses the C boundary. */
     enum Mapping {
@@ -71,7 +79,16 @@ final class CEntryPointGenerator {
     record Entry(ExecutableElement method, String symbol, TypeMirror exceptionHandler) {
     }
 
-    record SupportSymbols(String createIsolate, String tearDownIsolate, String releaseHandle) {
+    /** {@code builtins} maps each name from {@link #builtinNames()} to its exported symbol. */
+    record SupportSymbols(String createIsolate, String tearDownIsolate, String releaseHandle, Map<String, String> builtins) {
+    }
+
+    /** The {@link Builtins} plus {@value #FUTURE_ON_COMPLETE}, which only C callers get. */
+    static List<String> builtinNames() {
+        List<String> names = new ArrayList<>();
+        Builtins.ALL.forEach(b -> names.add(b.name()));
+        names.add(FUTURE_ON_COMPLETE);
+        return names;
     }
 
     private final Elements elements;
@@ -167,7 +184,95 @@ final class CEntryPointGenerator {
                 .endControlFlow()
                 .build());
 
+        addBuiltins(clazz, packageName, symbols);
+        addHelpers(clazz, EnumSet.of(Mapping.STRING, Mapping.HANDLE), EnumSet.of(Mapping.STRING, Mapping.HANDLE));
         return JavaFile.builder(packageName, clazz.build()).skipJavaLangImports(true).build();
+    }
+
+    /** Wraps each {@link Builtins.Builtin} in an entry point, and adds {@value #FUTURE_ON_COMPLETE}. */
+    private void addBuiltins(TypeSpec.Builder clazz, String packageName, SupportSymbols symbols) {
+        for (Builtins.Builtin builtin : Builtins.ALL) {
+            String symbol = symbols.builtins().get(builtin.name());
+            MethodSpec.Builder method = MethodSpec.methodBuilder(builtin.name())
+                    .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                    .returns(cType(builtin.returns()))
+                    .addParameter(ParameterSpec.builder(ISOLATE_THREAD, "isolateThread")
+                            .addAnnotation(ISOLATE_THREAD_CONTEXT)
+                            .build());
+            List<CodeBlock> args = new ArrayList<>();
+            for (Builtins.Param param : builtin.params()) {
+                method.addParameter(cType(param.type()), param.name());
+                args.add(switch (param.type()) {
+                    case HANDLE -> CodeBlock.of("$N($N)", FROM_HANDLE, param.name());
+                    case STRING -> CodeBlock.of("$N($N)", TO_JAVA_STRING, param.name());
+                    default -> CodeBlock.of("$N", param.name());
+                });
+            }
+            CodeBlock call = CodeBlock.of("$N($L)", builtin.implName(), CodeBlock.join(args, ", "));
+            method.addStatement("return $L", switch (builtin.returns()) {
+                case HANDLE -> CodeBlock.of("$N($L)", TO_HANDLE, call);
+                case STRING -> CodeBlock.of("$N($L)", TO_C_STRING, call);
+                default -> call;
+            });
+
+            List<String> docs = new ArrayList<>(List.of(builtin.doc()));
+            if (builtin.returns() == Builtins.Type.STRING) {
+                docs.add("The returned string is allocated with malloc and must be released by the caller with free().");
+            } else if (builtin.returns() == Builtins.Type.HANDLE) {
+                docs.add("The returned handle keeps its object alive until it is passed to " + symbols.releaseHandle() + "().");
+            }
+            method.addAnnotation(AnnotationSpec.builder(C_ENTRY_POINT)
+                    .addMember("name", "$S", symbol)
+                    .addMember("documentation", "{$L}", CodeBlock.join(docs.stream().map(d -> CodeBlock.of("$S", d)).toList(), ", "))
+                    .build());
+            clazz.addMethod(method.build());
+            clazz.addMethod(builtin.impl());
+        }
+        clazz.addMethod(Builtins.describe());
+
+        ClassName callback = ClassName.get(packageName, SUPPORT_CLASS, FUTURE_CALLBACK);
+        clazz.addType(TypeSpec.interfaceBuilder(FUTURE_CALLBACK)
+                .addModifiers(Modifier.PUBLIC)
+                .addJavadoc("{@code void (*)(graal_isolatethread_t *thread, void *userData)}, called by {@code $L}.\n",
+                        symbols.builtins().get(FUTURE_ON_COMPLETE))
+                .addSuperinterface(C_FUNCTION_POINTER)
+                .addMethod(MethodSpec.methodBuilder("invoke")
+                        .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
+                        .addAnnotation(INVOKE_C_FUNCTION_POINTER)
+                        .addParameter(ISOLATE_THREAD, "thread")
+                        .addParameter(VOID_POINTER, "userData")
+                        .build())
+                .build());
+        clazz.addMethod(MethodSpec.methodBuilder(FUTURE_ON_COMPLETE)
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                .addAnnotation(AnnotationSpec.builder(C_ENTRY_POINT)
+                        .addMember("name", "$S", symbols.builtins().get(FUTURE_ON_COMPLETE))
+                        .addMember("documentation", "{$S, $S, $S}",
+                                "Calls callback(thread, userData) once the CompletableFuture (or other CompletionStage) behind the handle completes, normally or not.",
+                                "It runs on the completing thread, or immediately on this one if the future is already complete; thread may be used to call back into the isolate.",
+                                "The future is kept alive until then, even if its handle is released.")
+                        .build())
+                .addParameter(ParameterSpec.builder(ISOLATE_THREAD, "isolateThread")
+                        .addAnnotation(ISOLATE_THREAD_CONTEXT)
+                        .build())
+                .addParameter(OBJECT_HANDLE, "future")
+                .addParameter(callback, "callback")
+                .addParameter(VOID_POINTER, "userData")
+                // Word values cannot be captured by the lambda's object, so they cross it as raw addresses
+                .addStatement("long callbackAddress = callback.rawValue()")
+                .addStatement("long userDataAddress = userData.rawValue()")
+                .addStatement("(($T<?>) $N(future)).whenComplete((result, error) -> $T.<$T>pointer(callbackAddress)"
+                                + ".invoke($T.getCurrentThread(), $T.pointer(userDataAddress)))",
+                        CompletionStage.class, FROM_HANDLE, WORD_FACTORY, callback, CURRENT_ISOLATE, WORD_FACTORY)
+                .build());
+    }
+
+    private static TypeName cType(Builtins.Type type) {
+        return switch (type) {
+            case HANDLE -> OBJECT_HANDLE;
+            case STRING -> C_CHAR_POINTER;
+            default -> type.javaType;
+        };
     }
 
     private static TypeSpec.Builder generatedClass(String simpleName) {

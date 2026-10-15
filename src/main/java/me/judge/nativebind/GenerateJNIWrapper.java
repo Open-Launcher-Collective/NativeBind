@@ -45,6 +45,12 @@ import java.lang.annotation.Target;
  * on the JVM class named by the {@code nativebind.jni.class} option, or on the one class every annotated method
  * uses (mixed classes require the option). Alongside it, NativeBind generates a {@code Feature} that registers the
  * {@code NativeBridgeSupport} jniutils needs, and a {@code native-image.properties} that enables it.
+ * <p>
+ * The same class also backs native methods for working with handles to commonly returned types:
+ * {@code futureIsDone}, {@code futureAwait}, {@code futureGet}, {@code futureError}, {@code futureCancel},
+ * {@code handleToString}, {@code stringToHandle}, {@code unboxBoolean}, {@code unboxLong}, {@code unboxDouble},
+ * {@code collectionSize}, {@code listGet}, {@code mapKeys}, {@code mapGet} and {@code optionalGet}. A hand-written
+ * JVM class only needs to declare the ones it uses.
  */
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.SOURCE)

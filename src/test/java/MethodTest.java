@@ -142,6 +142,53 @@ import java.util.Map;
     }
 
     @Test
+    public void generatesBuiltinsForCommonTypes() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), "demo.Api", """
+                package demo;
+
+                import java.util.concurrent.CompletableFuture;
+                import me.judge.nativebind.GenerateJNIWrapper;
+                import me.judge.nativebind.GenerateNativeWrapper;
+
+                public class Api {
+                    @GenerateNativeWrapper(prefix = "lib")
+                    @GenerateJNIWrapper
+                    public static CompletableFuture<String> fetch() { return CompletableFuture.completedFuture("x"); }
+                }
+                """);
+        assertTrue(result.success(), result.errors());
+
+        String c = result.source("demo/NativeBindCEntryPoints.java");
+        assertTrue(c.contains("@CEntryPoint(name = \"libFutureIsDone\""), c);
+        assertTrue(c.contains("public static boolean futureIsDone(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle future)"), c);
+        assertTrue(c.contains("public static boolean futureAwait(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle future, long timeoutMillis)"), c);
+        assertTrue(c.contains("return nativeBind$toHandle(nativeBind$futureGet(nativeBind$fromHandle(future)));"), c);
+        assertTrue(c.contains("public static CCharPointer futureError(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle future)"), c);
+        assertTrue(c.contains("public static ObjectHandle stringToHandle(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, CCharPointer value)"), c);
+        assertTrue(c.contains("public static long unboxLong(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle value)"), c);
+        assertTrue(c.contains("public static ObjectHandle listGet(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle list, int index)"), c);
+        assertTrue(c.contains("\"The returned handle keeps its object alive until it is passed to libReleaseHandle().\""), c);
+        assertTrue(c.contains("@CEntryPoint(name = \"libFutureOnComplete\""), c);
+        assertTrue(c.contains("public static void futureOnComplete(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle future, FutureCallback callback, VoidPointer userData)"), c);
+        assertTrue(c.contains("public interface FutureCallback extends CFunctionPointer { @InvokeCFunctionPointer void invoke(IsolateThread thread, VoidPointer userData);"), c);
+
+        String jvm = result.source("demo/jvm/Entrypoints.java");
+        assertTrue(jvm.contains("public static native boolean futureIsDone(long future, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native long futureGet(long future, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native String futureError(long future, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native long stringToHandle(String value, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native double unboxDouble(long value, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native long mapGet(long map, long key, long isolateThread);"), jvm);
+        assertFalse(jvm.contains("futureOnComplete"), jvm);
+
+        String jni = result.source("demo/NativeBindJNIEntryPoints.java");
+        assertTrue(jni.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_futureGet\")"), jni);
+        assertTrue(jni.contains("public static JNI.JString futureError(JNI.JNIEnv env, JNI.JClass clazz, ObjectHandle future, @CEntryPoint.IsolateThreadContext IsolateThread isolateThread)"), jni);
+        assertTrue(jni.contains("return JNIUtil.createHSString(env, nativeBind$futureError(nativeBind$fromHandle(future)));"), jni);
+        assertTrue(jni.contains("catch (Throwable nativeBind$error) { nativeBind$throwInJvm(env, nativeBind$error); return false; }"), jni);
+    }
+
+    @Test
     public void generatesOneSupportClassForManyWrappedClasses() throws IOException {
         Result result = compile(List.of(), Map.of(
                 "demo.a.First", """
