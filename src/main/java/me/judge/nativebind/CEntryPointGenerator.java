@@ -295,23 +295,23 @@ final class CEntryPointGenerator {
 
     private MethodSpec wrapper(TypeElement owner, Entry entry, String releaseHandleSymbol, Set<Mapping> usedParams, Set<Mapping> usedReturns) {
         ExecutableElement method = entry.method();
-        boolean isStatic = method.getModifiers().contains(Modifier.STATIC);
+        TypeMirror returnType = Wrapped.returnType(method);
 
         Set<String> taken = new HashSet<>();
         for (VariableElement p : method.getParameters()) {
             taken.add(p.getSimpleName().toString());
         }
         String threadParam = unique("isolateThread", taken);
-        String selfParam = isStatic ? null : unique("self", taken);
+        String selfParam = Wrapped.hasReceiver(method) ? unique("self", taken) : null;
 
-        Mapping returnMapping = mappingOf(method.getReturnType());
+        Mapping returnMapping = mappingOf(returnType);
         usedReturns.add(returnMapping);
 
         String javaName = SourceVersion.isKeyword(entry.symbol()) ? entry.symbol() + "_" : entry.symbol();
         MethodSpec.Builder builder = MethodSpec.methodBuilder(javaName)
                 .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
                 .addAnnotation(entryPointAnnotation(entry, returnMapping, releaseHandleSymbol))
-                .returns(returnMapping.cType(method.getReturnType()))
+                .returns(returnMapping.cType(returnType))
                 .addParameter(ParameterSpec.builder(ISOLATE_THREAD, threadParam)
                         .addAnnotation(ISOLATE_THREAD_CONTEXT)
                         .build());
@@ -337,10 +337,15 @@ final class CEntryPointGenerator {
             builder.addException(TypeName.get(thrown));
         }
 
-        CodeBlock target = isStatic
-                ? CodeBlock.of("$T", ClassName.get(owner))
-                : CodeBlock.of("(($T) $N($N))", TypeName.get(types.erasure(owner.asType())), FROM_HANDLE, selfParam);
-        CodeBlock call = CodeBlock.of("$L.$N($L)", target, method.getSimpleName().toString(), CodeBlock.join(args, ", "));
+        CodeBlock call;
+        if (Wrapped.isConstructor(method)) {
+            call = CodeBlock.of("new $T($L)", ClassName.get(owner), CodeBlock.join(args, ", "));
+        } else {
+            CodeBlock target = selfParam == null
+                    ? CodeBlock.of("$T", ClassName.get(owner))
+                    : CodeBlock.of("(($T) $N($N))", TypeName.get(types.erasure(owner.asType())), FROM_HANDLE, selfParam);
+            call = CodeBlock.of("$L.$N($L)", target, method.getSimpleName().toString(), CodeBlock.join(args, ", "));
+        }
 
         switch (returnMapping) {
             case VOID -> builder.addStatement("$L", call);

@@ -195,7 +195,7 @@ final class JNIEntryPointGenerator {
         for (VariableElement p : method.getParameters()) {
             params.add(map(p.asType()));
         }
-        Mapping returns = map(method.getReturnType());
+        Mapping returns = map(Wrapped.returnType(method));
         if (returns.kind() == Kind.ENV) {
             throw new IllegalArgumentException("JNIEnv cannot be returned to the JVM");
         }
@@ -210,7 +210,7 @@ final class JNIEntryPointGenerator {
         List<TypeName> paramTypes = new ArrayList<>();
         List<String> paramNames = new ArrayList<>();
         StringBuilder descriptor = new StringBuilder();
-        if (!method.getModifiers().contains(Modifier.STATIC)) {
+        if (Wrapped.hasReceiver(method)) {
             paramTypes.add(TypeName.LONG);
             paramNames.add(unique("self", taken));
             descriptor.append('J');
@@ -232,8 +232,7 @@ final class JNIEntryPointGenerator {
         if (doc != null) {
             javadoc.append(doc.strip()).append("\n\n");
         }
-        javadoc.append("Calls {@code ").append(method.getEnclosingElement().getSimpleName()).append('.')
-                .append(method.getSimpleName()).append("} in the native image.\n");
+        javadoc.append("Calls {@code ").append(Wrapped.displayName(method)).append("} in the native image.\n");
         if (signature.returns().kind() == Kind.HANDLE) {
             javadoc.append("The returned handle must be passed to {@code releaseHandle} once it is no longer needed.\n");
         }
@@ -323,13 +322,11 @@ final class JNIEntryPointGenerator {
     private MethodSpec wrapper(TypeElement owner, Entry entry, Set<Kind> usedParams, Set<Kind> usedReturns) {
         ExecutableElement method = entry.method();
         Signature signature = entry.signature();
-        boolean isStatic = method.getModifiers().contains(Modifier.STATIC);
-
         Set<String> taken = new HashSet<>();
         method.getParameters().forEach(p -> taken.add(p.getSimpleName().toString()));
         String env = unique("env", taken);
         String clazz = unique("clazz", taken);
-        String self = isStatic ? null : unique("self", taken);
+        String self = Wrapped.hasReceiver(method) ? unique("self", taken) : null;
         String thread = unique("isolateThread", taken);
 
         Mapping returns = signature.returns();
@@ -366,10 +363,15 @@ final class JNIEntryPointGenerator {
         }
         builder.addParameter(ParameterSpec.builder(ISOLATE_THREAD, thread).addAnnotation(ISOLATE_THREAD_CONTEXT).build());
 
-        CodeBlock target = isStatic
-                ? CodeBlock.of("$T", ClassName.get(owner))
-                : CodeBlock.of("(($T) $N($N))", TypeName.get(types.erasure(owner.asType())), FROM_HANDLE, self);
-        CodeBlock call = CodeBlock.of("$L.$N($L)", target, method.getSimpleName().toString(), CodeBlock.join(args, ", "));
+        CodeBlock call;
+        if (Wrapped.isConstructor(method)) {
+            call = CodeBlock.of("new $T($L)", ClassName.get(owner), CodeBlock.join(args, ", "));
+        } else {
+            CodeBlock target = self == null
+                    ? CodeBlock.of("$T", ClassName.get(owner))
+                    : CodeBlock.of("(($T) $N($N))", TypeName.get(types.erasure(owner.asType())), FROM_HANDLE, self);
+            call = CodeBlock.of("$L.$N($L)", target, method.getSimpleName().toString(), CodeBlock.join(args, ", "));
+        }
 
         String scopeName = owner.getQualifiedName() + "." + method.getSimpleName();
         builder.beginControlFlow("try ($T $N = new $T($S, $N))", JNI_METHOD_SCOPE, SCOPE, JNI_METHOD_SCOPE, scopeName, env);

@@ -41,7 +41,7 @@ import java.lang.annotation.Target;
  *     <li>containers: {@code collectionSize}, {@code listGet}, {@code mapKeys}, {@code mapGet}, {@code optionalGet}</li>
  * </ul>
  */
-@Target(ElementType.METHOD)
+@Target({ElementType.METHOD, ElementType.CONSTRUCTOR})
 @Retention(RetentionPolicy.SOURCE)
 public @interface GenerateNativeWrapper {
     /**

@@ -142,6 +142,85 @@ import java.util.Map;
     }
 
     @Test
+    public void wrapsConstructorsAsFactories() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), "demo.Account", """
+                package demo;
+
+                import me.judge.nativebind.GenerateJNIWrapper;
+                import me.judge.nativebind.GenerateNativeWrapper;
+
+                public class Account {
+                    /** Creates an account. */
+                    @GenerateNativeWrapper(prefix = "lib")
+                    @GenerateJNIWrapper
+                    public Account(String username, int id) {}
+
+                    @GenerateNativeWrapper(prefix = "lib", name = "guestAccount")
+                    @GenerateJNIWrapper
+                    Account() throws java.io.IOException {}
+                }
+                """);
+        assertTrue(result.success(), result.errors());
+
+        // Constructors default to "new" + the class name and hand back a handle to the new object
+        String c = result.source("demo/AccountCEntryPoints.java");
+        assertTrue(c.contains("@CEntryPoint(name = \"libNewAccount\""), c);
+        assertTrue(c.contains("\"Creates an account.\""), c);
+        assertTrue(c.contains("public static ObjectHandle libNewAccount(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, CCharPointer username, int id)"), c);
+        assertTrue(c.contains("return nativeBind$toHandle(new Account(nativeBind$toJavaString(username), id));"), c);
+        assertTrue(c.contains("public static ObjectHandle libGuestAccount(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread) throws IOException"), c);
+        assertTrue(c.contains("return nativeBind$toHandle(new Account());"), c);
+        assertFalse(c.contains("<init>"), c);
+        assertFalse(c.contains("ObjectHandle self"), c);
+
+        String jvm = result.source("demo/jvm/Entrypoints.java");
+        assertTrue(jvm.contains("Creates an account."), jvm);
+        assertTrue(jvm.contains("public static native long newAccount(String username, int id, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native long newAccount(long isolateThread);"), jvm);
+        assertFalse(jvm.contains("<init>"), jvm);
+
+        String jni = result.source("demo/AccountJNIEntryPoints.java");
+        // Overloaded, so the long names carrying the argument descriptors are used
+        assertTrue(jni.contains("name = \"Java_demo_jvm_Entrypoints_newAccount__Ljava_lang_String_2IJ\""), jni);
+        assertTrue(jni.contains("name = \"Java_demo_jvm_Entrypoints_newAccount__J\""), jni);
+        assertTrue(jni.contains("try (JNIMethodScope nativeBind$scope = new JNIMethodScope(\"demo.Account.<init>\", env))"), jni);
+        assertTrue(jni.contains("return nativeBind$toHandle(new Account(JNIUtil.createString(env, username), id));"), jni);
+        assertTrue(jni.contains("return nativeBind$toHandle(new Account());"), jni);
+        assertFalse(jni.contains("ObjectHandle self"), jni);
+    }
+
+    @Test
+    public void rejectsConstructorsThatCannotBeCalled() throws IOException {
+        Result result = compile(List.of(), "demo.Outer", """
+                package demo;
+
+                import me.judge.nativebind.GenerateNativeWrapper;
+
+                public class Outer {
+                    public abstract static class Shape {
+                        @GenerateNativeWrapper(prefix = "lib")
+                        public Shape() {}
+                    }
+
+                    public class Inner {
+                        @GenerateNativeWrapper(prefix = "lib")
+                        public Inner() {}
+                    }
+
+                    public static class Nested {
+                        @GenerateNativeWrapper(prefix = "lib")
+                        public Nested() {}
+                    }
+                }
+                """);
+        assertFalse(result.success());
+        String errors = result.errors();
+        assertTrue(errors.contains("constructors must belong to a class that can be instantiated"), errors);
+        assertTrue(errors.contains("constructors must not belong to an inner (non-static) class"), errors);
+        assertEquals(2, errors.lines().count(), errors);
+    }
+
+    @Test
     public void generatesBuiltinsForCommonTypes() throws IOException {
         Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), "demo.Api", """
                 package demo;

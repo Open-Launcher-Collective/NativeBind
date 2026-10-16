@@ -52,7 +52,7 @@ import java.lang.annotation.Target;
  * {@code collectionSize}, {@code listGet}, {@code mapKeys}, {@code mapGet} and {@code optionalGet}. A hand-written
  * JVM class only needs to declare the ones it uses.
  */
-@Target(ElementType.METHOD)
+@Target({ElementType.METHOD, ElementType.CONSTRUCTOR})
 @Retention(RetentionPolicy.SOURCE)
 public @interface GenerateJNIWrapper {
     /**

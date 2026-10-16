@@ -159,7 +159,7 @@ public class NativeBindProcessor extends AbstractProcessor {
                 error(method, "\"" + jniClass + "\" is not a valid class binary name");
                 continue;
             }
-            String name = annotation.name().isEmpty() ? method.getSimpleName().toString() : annotation.name();
+            String name = annotation.name().isEmpty() ? Wrapped.defaultName(method) : annotation.name();
             if (!SourceVersion.isIdentifier(name) || SourceVersion.isKeyword(name)) {
                 error(method, "\"" + name + "\" is not a valid Java method name");
                 continue;
@@ -455,9 +455,21 @@ public class NativeBindProcessor extends AbstractProcessor {
                 ok = false;
             }
         }
-        if (method.getKind() != ElementKind.METHOD) {
-            error(method, annotation + " only applies to methods");
+        if (method.getKind() != ElementKind.METHOD && method.getKind() != ElementKind.CONSTRUCTOR) {
+            error(method, annotation + " only applies to methods and constructors");
             ok = false;
+        }
+        if (Wrapped.isConstructor(method)) {
+            // The generated factory calls "new Owner(...)", which needs a concrete class and no enclosing instance
+            TypeElement owner = (TypeElement) method.getEnclosingElement();
+            if (owner.getKind() == ElementKind.ENUM || owner.getModifiers().contains(Modifier.ABSTRACT)) {
+                error(method, annotation + " constructors must belong to a class that can be instantiated");
+                ok = false;
+            }
+            if (owner.getNestingKind() == NestingKind.MEMBER && !owner.getModifiers().contains(Modifier.STATIC)) {
+                error(method, annotation + " constructors must not belong to an inner (non-static) class");
+                ok = false;
+            }
         }
         return ok;
     }
@@ -471,7 +483,7 @@ public class NativeBindProcessor extends AbstractProcessor {
 
         String base;
         if (annotation.name().isEmpty()) {
-            base = CNames.sanitize(method.getSimpleName().toString());
+            base = CNames.sanitize(Wrapped.defaultName(method));
         } else if (annotation.name().chars().allMatch(c -> c == '_' || (c < 128 && Character.isLetterOrDigit(c)))) {
             base = annotation.name();
         } else {
