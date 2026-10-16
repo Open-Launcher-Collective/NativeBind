@@ -437,6 +437,15 @@ import java.util.Map;
         assertTrue(jvm.contains("public static native long createIsolate();"), jvm);
         assertTrue(jvm.contains("public static native int tearDownIsolate(long isolateThread);"), jvm);
         assertTrue(jvm.contains("public static native void releaseHandle(long handle, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native long attachThread(long isolate);"), jvm);
+        assertTrue(jvm.contains("public static native int detachThread(long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native long getIsolate(long isolateThread);"), jvm);
+        // Each Java thread resolves its own isolate thread instead of sharing the creating thread's
+        assertTrue(jvm.contains("public static long openIsolate()"), jvm);
+        assertTrue(jvm.contains("public static long currentIsolateThread(long isolate)"), jvm);
+        assertTrue(jvm.contains("long thread = attachThread(isolate);"), jvm);
+        assertTrue(jvm.contains("public static void detachCurrentThread(long isolate)"), jvm);
+        assertTrue(jvm.contains("public static void closeIsolate(long isolate)"), jvm);
         assertTrue(jvm.contains("Says hello."), jvm);
         assertTrue(jvm.contains("public static native String greet(String name, long isolateThread);"), jvm);
         assertTrue(jvm.contains("public static native int sum(int[] values, long isolateThread);"), jvm);
@@ -472,6 +481,10 @@ import java.util.Map;
         assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_createIsolate\", builtin = CEntryPoint.Builtin.CREATE_ISOLATE)"), support);
         assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_tearDownIsolate\", builtin = CEntryPoint.Builtin.TEAR_DOWN_ISOLATE)"), support);
         assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_releaseHandle\")"), support);
+        assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_attachThread\", builtin = CEntryPoint.Builtin.ATTACH_THREAD)"), support);
+        assertTrue(support.contains("public static native IsolateThread attachThread(JNI.JNIEnv env, JNI.JClass clazz, @CEntryPoint.IsolateContext Isolate isolate);"), support);
+        assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_detachThread\", builtin = CEntryPoint.Builtin.DETACH_THREAD)"), support);
+        assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_getIsolate\", builtin = CEntryPoint.Builtin.GET_ISOLATE)"), support);
         // Errors reach the JVM with their native stack trace and causes, not just the outermost message
         assertTrue(support.contains("error.printStackTrace(new PrintWriter(trace));"), support);
 
@@ -520,6 +533,24 @@ import java.util.Map;
                     "demo/b/SecondCEntryPoints.java",
                     "demo/b/SecondJNIEntryPoints.java"), names);
         }
+    }
+
+    @Test
+    public void rejectsNativesShadowingThreadHelpers() throws IOException {
+        Result result = compile(List.of(), "demo.Api", """
+                package demo;
+
+                public class Api {
+                    @me.judge.nativebind.GenerateJNIWrapper(jniClass = "demo.Natives")
+                    public static long currentIsolateThread() { return 0; }
+
+                    @me.judge.nativebind.GenerateJNIWrapper(jniClass = "demo.Natives", name = "threadId")
+                    public static long isolateThread() { return 0; }
+                }
+                """);
+        assertFalse(result.success());
+        assertEquals("demo.Natives.currentIsolateThread is reserved for isolate thread management; "
+                + "set @GenerateJNIWrapper(name = ...) to rename it", result.errors());
     }
 
     @Test

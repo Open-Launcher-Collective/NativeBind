@@ -16,8 +16,16 @@ import java.lang.annotation.Target;
  * methods are exported under JNI long names ({@code ..._attemptLogin__Ljava_lang_String_2J}) so overloads work as
  * they do in Java.
  * <p>
- * Every JVM-side native method takes the {@code IsolateThread} (from {@code createIsolate()}) as its last
- * {@code long} parameter. Parameter and return types are mapped as follows (native side / JVM side):
+ * Every JVM-side native method takes an {@code IsolateThread} as its last {@code long} parameter. An isolate thread
+ * belongs to the OS thread that created or attached it, and passing it from any other thread crashes the process. The
+ * generated JVM class therefore manages them per thread: {@code openIsolate()} returns the isolate, which any thread
+ * may hold, {@code currentIsolateThread(isolate)} returns the calling thread's isolate thread (attaching the thread on
+ * first use and caching it), {@code detachCurrentThread(isolate)} releases it before the thread finishes, and
+ * {@code closeIsolate(isolate)} tears the isolate down. These are built on the {@code attachThread(long isolate)},
+ * {@code detachThread(long isolateThread)} and {@code getIsolate(long isolateThread)} natives, which a hand-written
+ * class may declare to manage threads itself.
+ * <p>
+ * Parameter and return types are mapped as follows (native side / JVM side):
  * <ul>
  *     <li>primitives are passed through unchanged</li>
  *     <li>{@link String} / {@code String[]} and primitive arrays are copied between heaps with {@code JNIUtil}</li>
@@ -41,7 +49,8 @@ import java.lang.annotation.Target;
  * the entry points.
  * <p>
  * Exactly one {@code NativeBindJNIEntryPoints} class is generated per compilation, however many classes use this
- * annotation. It backs {@code createIsolate()}, {@code tearDownIsolate(long)} and {@code releaseHandle(long, long)}
+ * annotation. It backs {@code createIsolate()}, {@code tearDownIsolate(long)}, {@code releaseHandle(long, long)} and
+ * the thread natives above
  * on the JVM class named by the {@code nativebind.jni.class} option, or on the one class every annotated method
  * uses (mixed classes require the option). Alongside it, NativeBind generates a {@code Feature} that registers the
  * {@code NativeBridgeSupport} jniutils needs, and a {@code native-image.properties} that enables it.

@@ -211,6 +211,7 @@ public class NativeBindProcessor extends AbstractProcessor {
             if (supportJvmClass != null && supportPackage != null) {
                 List<DeclaredNative> natives = new ArrayList<>();
                 JNIEntryPointGenerator.supportNatives().forEach(n -> natives.add(new DeclaredNative(n, null)));
+                JNIEntryPointGenerator.threadNatives().forEach(n -> natives.add(new DeclaredNative(n, null)));
                 JNIEntryPointGenerator.builtinNatives().forEach(n -> natives.add(new DeclaredNative(n, null)));
                 natives.addAll(byJvmClass.getOrDefault(supportJvmClass, List.of()));
                 byJvmClass.put(supportJvmClass, natives);
@@ -221,8 +222,11 @@ public class NativeBindProcessor extends AbstractProcessor {
 
         Map<ExecutableElement, String> symbols = new HashMap<>();
         Map<String, String> supportSymbols = new HashMap<>();
-        Set<String> builtinNames = new HashSet<>();
-        JNIEntryPointGenerator.builtinNatives().forEach(n -> builtinNames.add(n.name()));
+        // Support natives a hand-written class may leave out
+        Set<String> optionalNames = new HashSet<>();
+        JNIEntryPointGenerator.threadNatives().forEach(n -> optionalNames.add(n.name()));
+        JNIEntryPointGenerator.builtinNatives().forEach(n -> optionalNames.add(n.name()));
+        String supportClass = supportJvmClass;
         byJvmClass.forEach((jvmClass, natives) -> {
             TypeElement existing = generateJvmClasses ? null : processingEnv.getElementUtils().getTypeElement(jvmClass.replace('$', '.'));
             Element anyOrigin = natives.stream().map(DeclaredNative::method).filter(m -> m != null).findFirst().orElse(null);
@@ -257,6 +261,12 @@ public class NativeBindProcessor extends AbstractProcessor {
                             + "set @GenerateJNIWrapper(name = ...) to disambiguate");
                     continue;
                 }
+                if (method != null && generateJvmClasses && jvmClass.equals(supportClass)
+                        && JNIEntryPointGenerator.JVM_HELPERS.contains(jvmNative.name())) {
+                    error(method, jvmClass + "." + jvmNative.name() + " is reserved for isolate thread management; "
+                            + "set @GenerateJNIWrapper(name = ...) to rename it");
+                    continue;
+                }
                 accepted.add(jvmNative);
                 String symbol = descriptorsByName.get(jvmNative.name()).size() > 1
                         ? JNINames.longName(jvmClass, jvmNative.name(), jvmNative.argumentDescriptor())
@@ -268,7 +278,7 @@ public class NativeBindProcessor extends AbstractProcessor {
                     symbols.put(method, symbol);
                 }
                 // A hand-written class only needs the builtins it wants to call
-                boolean optional = method == null && builtinNames.contains(jvmNative.name())
+                boolean optional = method == null && optionalNames.contains(jvmNative.name())
                         && !existingDescriptors.containsKey(jvmNative.name());
                 if (existing != null && !optional) {
                     String problem = generator.verify(existing, jvmNative);
@@ -279,13 +289,14 @@ public class NativeBindProcessor extends AbstractProcessor {
             }
 
             if (existing == null) {
-                write(generator.generateJvmClass(jvmClass, accepted, owners), anyOrigin);
+                write(generator.generateJvmClass(jvmClass, accepted, jvmClass.equals(supportClass), owners), anyOrigin);
             }
         });
 
-        if (supportJvmClass != null && supportSymbols.size() == JNIEntryPointGenerator.supportNatives().size() + builtinNames.size()) {
+        if (supportJvmClass != null && supportSymbols.size() == JNIEntryPointGenerator.supportNatives().size() + optionalNames.size()) {
             JNIEntryPointGenerator.SupportSymbols support = new JNIEntryPointGenerator.SupportSymbols(
                     supportSymbols.get("createIsolate"), supportSymbols.get("tearDownIsolate"), supportSymbols.get("releaseHandle"),
+                    supportSymbols.get("attachThread"), supportSymbols.get("detachThread"), supportSymbols.get("getIsolate"),
                     supportSymbols);
             write(generator.generateSupport(supportPackage, support, owners), null);
             write(generator.generateFeature(supportPackage, owners), null);

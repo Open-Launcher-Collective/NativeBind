@@ -4,6 +4,7 @@ import com.palantir.javapoet.AnnotationSpec;
 import com.palantir.javapoet.ArrayTypeName;
 import com.palantir.javapoet.ClassName;
 import com.palantir.javapoet.CodeBlock;
+import com.palantir.javapoet.FieldSpec;
 import com.palantir.javapoet.JavaFile;
 import com.palantir.javapoet.MethodSpec;
 import com.palantir.javapoet.ParameterSpec;
@@ -34,6 +35,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Generates {@code @CEntryPoint}s that a JVM binds to {@code native} methods, along with the JVM-side class
@@ -64,7 +66,9 @@ final class JNIEntryPointGenerator {
     private static final ClassName C_ENTRY_POINT = ClassName.get("org.graalvm.nativeimage.c.function", "CEntryPoint");
     private static final ClassName C_ENTRY_POINT_BUILTIN = C_ENTRY_POINT.nestedClass("Builtin");
     private static final ClassName ISOLATE_THREAD_CONTEXT = C_ENTRY_POINT.nestedClass("IsolateThreadContext");
+    private static final ClassName ISOLATE_CONTEXT = C_ENTRY_POINT.nestedClass("IsolateContext");
     private static final ClassName ISOLATE_THREAD = ClassName.get("org.graalvm.nativeimage", "IsolateThread");
+    private static final ClassName ISOLATE = ClassName.get("org.graalvm.nativeimage", "Isolate");
     private static final ClassName OBJECT_HANDLE = ClassName.get("org.graalvm.nativeimage", "ObjectHandle");
     private static final ClassName OBJECT_HANDLES = ClassName.get("org.graalvm.nativeimage", "ObjectHandles");
     private static final ClassName IMAGE_SINGLETONS = ClassName.get("org.graalvm.nativeimage", "ImageSingletons");
@@ -80,6 +84,11 @@ final class JNIEntryPointGenerator {
     private static final String FROM_HANDLE = "nativeBind$fromHandle";
     private static final String TO_HANDLE = "nativeBind$toHandle";
     private static final String THROW_IN_JVM = "nativeBind$throwInJvm";
+    private static final String CURRENT = "nativeBind$current";
+    private static final String EPOCH = "nativeBind$epoch";
+
+    /** Non-native methods generated into the JVM class declaring the support natives; user natives may not reuse their names. */
+    static final Set<String> JVM_HELPERS = Set.of("openIsolate", "currentIsolateThread", "detachCurrentThread", "closeIsolate");
 
     /** How a Java value crosses the JNI boundary. */
     enum Kind {
@@ -108,7 +117,8 @@ final class JNIEntryPointGenerator {
     }
 
     /** {@code builtins} maps each {@link Builtins.Builtin} name to its exported symbol. */
-    record SupportSymbols(String createIsolate, String tearDownIsolate, String releaseHandle, Map<String, String> builtins) {
+    record SupportSymbols(String createIsolate, String tearDownIsolate, String releaseHandle, String attachThread,
+                          String detachThread, String getIsolate, Map<String, String> builtins) {
     }
 
     private final Elements elements;
@@ -251,6 +261,22 @@ final class JNIEntryPointGenerator {
                         "Tears down the isolate owning {@code isolateThread}; returns 0 on success.\n"),
                 new JvmNative("releaseHandle", List.of(TypeName.LONG, TypeName.LONG), List.of("handle", "isolateThread"), TypeName.VOID, "JJ", "V",
                         "Releases a handle returned by a native method, allowing its object to be collected. Null handles are ignored.\n"));
+    }
+
+    /**
+     * Per-thread isolate management. An {@code IsolateThread} belongs to the OS thread it was created or attached on,
+     * and entering the isolate with it from any other thread crashes the process, so every other thread must attach
+     * itself first. Like {@link #builtinNatives()}, a hand-written class may omit them.
+     */
+    static List<JvmNative> threadNatives() {
+        return List.of(
+                new JvmNative("attachThread", List.of(TypeName.LONG), List.of("isolate"), TypeName.LONG, "J", "J",
+                        "Attaches the calling thread to {@code isolate} (from {@code getIsolate}) and returns its isolate thread, or 0 on "
+                                + "failure. A thread that is already attached gets its existing isolate thread back.\n"),
+                new JvmNative("detachThread", List.of(TypeName.LONG), List.of("isolateThread"), TypeName.INT, "J", "I",
+                        "Detaches the calling thread, which {@code isolateThread} must belong to, from its isolate; returns 0 on success.\n"),
+                new JvmNative("getIsolate", List.of(TypeName.LONG), List.of("isolateThread"), TypeName.LONG, "J", "J",
+                        "Returns the isolate that {@code isolateThread}, which must belong to the calling thread, is attached to, or 0 on failure.\n"));
     }
 
     /** The native methods backed by {@link Builtins}; unlike {@link #supportNatives()}, a hand-written class may omit them. */
@@ -532,6 +558,39 @@ final class JNIEntryPointGenerator {
                 .addStatement("$T.getGlobal().destroy(handle)", OBJECT_HANDLES)
                 .endControlFlow()
                 .build());
+        clazz.addMethod(MethodSpec.methodBuilder("attachThread")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.NATIVE)
+                .addAnnotation(AnnotationSpec.builder(C_ENTRY_POINT)
+                        .addMember("name", "$S", symbols.attachThread())
+                        .addMember("builtin", "$T.ATTACH_THREAD", C_ENTRY_POINT_BUILTIN)
+                        .build())
+                .returns(ISOLATE_THREAD)
+                .addParameter(JNI_ENV, "env")
+                .addParameter(JCLASS, "clazz")
+                .addParameter(ParameterSpec.builder(ISOLATE, "isolate").addAnnotation(ISOLATE_CONTEXT).build())
+                .build());
+        clazz.addMethod(MethodSpec.methodBuilder("detachThread")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.NATIVE)
+                .addAnnotation(AnnotationSpec.builder(C_ENTRY_POINT)
+                        .addMember("name", "$S", symbols.detachThread())
+                        .addMember("builtin", "$T.DETACH_THREAD", C_ENTRY_POINT_BUILTIN)
+                        .build())
+                .returns(int.class)
+                .addParameter(JNI_ENV, "env")
+                .addParameter(JCLASS, "clazz")
+                .addParameter(ParameterSpec.builder(ISOLATE_THREAD, "isolateThread").addAnnotation(ISOLATE_THREAD_CONTEXT).build())
+                .build());
+        clazz.addMethod(MethodSpec.methodBuilder("getIsolate")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.NATIVE)
+                .addAnnotation(AnnotationSpec.builder(C_ENTRY_POINT)
+                        .addMember("name", "$S", symbols.getIsolate())
+                        .addMember("builtin", "$T.GET_ISOLATE", C_ENTRY_POINT_BUILTIN)
+                        .build())
+                .returns(ISOLATE)
+                .addParameter(JNI_ENV, "env")
+                .addParameter(JCLASS, "clazz")
+                .addParameter(ParameterSpec.builder(ISOLATE_THREAD, "isolateThread").addAnnotation(ISOLATE_THREAD_CONTEXT).build())
+                .build());
 
         for (Builtins.Builtin builtin : Builtins.ALL) {
             clazz.addMethod(builtin(builtin, symbols.builtins().get(builtin.name())));
@@ -637,8 +696,11 @@ final class JNIEntryPointGenerator {
                 + "       --initialize-at-build-time=" + prefix + BRIDGE_SUPPORT_CLASS + "\n";
     }
 
-    /** The JVM-side class declaring every native method bound to {@code binaryName}. */
-    JavaFile generateJvmClass(String binaryName, List<JvmNative> natives, Iterable<? extends Element> origins) {
+    /**
+     * The JVM-side class declaring every native method bound to {@code binaryName}; with {@code support}, it also
+     * gets the {@link #JVM_HELPERS} that manage each Java thread's isolate thread.
+     */
+    JavaFile generateJvmClass(String binaryName, List<JvmNative> natives, boolean support, Iterable<? extends Element> origins) {
         int dot = binaryName.lastIndexOf('.');
         String packageName = dot < 0 ? "" : binaryName.substring(0, dot);
         String simpleName = binaryName.substring(dot + 1);
@@ -657,7 +719,90 @@ final class JNIEntryPointGenerator {
             }
             clazz.addMethod(method.build());
         }
+        if (support) {
+            addThreadHelpers(clazz);
+        }
         return JavaFile.builder(packageName, clazz.build()).skipJavaLangImports(true).build();
+    }
+
+    /**
+     * Isolate threads are bound to the OS thread that created or attached them, so a Java thread may only pass its
+     * own. These helpers let callers hold on to the isolate, which any thread may use, and look up the calling
+     * thread's isolate thread from it, attaching on first use. The lookup is cached per thread; the epoch, bumped by
+     * {@code closeIsolate}, keeps a cache from outliving its isolate when a later isolate reuses the same address.
+     * Plain JDK code only, so the JVM side keeps working on Android.
+     */
+    private static void addThreadHelpers(TypeSpec.Builder clazz) {
+        clazz.addField(FieldSpec.builder(AtomicLong.class, EPOCH, Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+                .initializer("new $T()", AtomicLong.class)
+                .build());
+        // {epoch, isolate, isolateThread} of the isolate the thread last used
+        clazz.addField(FieldSpec.builder(ParameterizedTypeName.get(ThreadLocal.class, long[].class), CURRENT,
+                        Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+                .initializer("$T.withInitial(() -> new long[3])", ThreadLocal.class)
+                .build());
+
+        clazz.addMethod(MethodSpec.methodBuilder("openIsolate")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                .addJavadoc("Creates an isolate and returns it. Unlike an isolate thread, the isolate may be shared between "
+                        + "threads; each one gets its own isolate thread from {@link #currentIsolateThread}.\n")
+                .returns(long.class)
+                .addStatement("long thread = createIsolate()")
+                .beginControlFlow("if (thread == 0)")
+                .addStatement("throw new $T($S)", IllegalStateException.class, "Could not create an isolate")
+                .endControlFlow()
+                .addStatement("long isolate = getIsolate(thread)")
+                .addStatement("long[] current = $N.get()", CURRENT)
+                .addStatement("current[0] = $N.get()", EPOCH)
+                .addStatement("current[1] = isolate")
+                .addStatement("current[2] = thread")
+                .addStatement("return isolate")
+                .build());
+        clazz.addMethod(MethodSpec.methodBuilder("currentIsolateThread")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                .addJavadoc("Returns the calling thread's isolate thread in {@code isolate}, attaching the thread on first use. "
+                        + "Pass it as the {@code isolateThread} argument of native methods called from this thread only: "
+                        + "entering an isolate with another thread's isolate thread crashes the process.\n")
+                .returns(long.class)
+                .addParameter(long.class, "isolate")
+                .addStatement("long[] current = $N.get()", CURRENT)
+                .addStatement("long epoch = $N.get()", EPOCH)
+                .beginControlFlow("if (current[2] == 0 || current[1] != isolate || current[0] != epoch)")
+                .addStatement("long thread = attachThread(isolate)")
+                .beginControlFlow("if (thread == 0)")
+                .addStatement("throw new $T($S + $T.currentThread().getName() + $S + $T.toHexString(isolate))",
+                        IllegalStateException.class, "Could not attach thread ", Thread.class, " to isolate 0x", Long.class)
+                .endControlFlow()
+                .addStatement("current[0] = epoch")
+                .addStatement("current[1] = isolate")
+                .addStatement("current[2] = thread")
+                .endControlFlow()
+                .addStatement("return current[2]")
+                .build());
+        clazz.addMethod(MethodSpec.methodBuilder("detachCurrentThread")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                .addJavadoc("Detaches the calling thread from {@code isolate}, releasing its isolate thread. Call it before a "
+                        + "thread that used the isolate finishes; a later call to {@link #currentIsolateThread} attaches it again.\n")
+                .addParameter(long.class, "isolate")
+                .addStatement("long thread = currentIsolateThread(isolate)")
+                .addStatement("$N.remove()", CURRENT)
+                .beginControlFlow("if (detachThread(thread) != 0)")
+                .addStatement("throw new $T($S + $T.toHexString(isolate))",
+                        IllegalStateException.class, "Could not detach from isolate 0x", Long.class)
+                .endControlFlow()
+                .build());
+        clazz.addMethod(MethodSpec.methodBuilder("closeIsolate")
+                .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                .addJavadoc("Tears down {@code isolate} from the calling thread. No other thread may use it afterwards.\n")
+                .addParameter(long.class, "isolate")
+                .addStatement("long thread = currentIsolateThread(isolate)")
+                .addStatement("$N.incrementAndGet()", EPOCH)
+                .addStatement("$N.remove()", CURRENT)
+                .beginControlFlow("if (tearDownIsolate(thread) != 0)")
+                .addStatement("throw new $T($S + $T.toHexString(isolate))",
+                        IllegalStateException.class, "Could not tear down isolate 0x", Long.class)
+                .endControlFlow()
+                .build());
     }
 
     /** Returns null when {@code existing} declares a matching {@code static native} method, else a description of the problem. */
