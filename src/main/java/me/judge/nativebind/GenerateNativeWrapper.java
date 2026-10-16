@@ -19,6 +19,13 @@ import java.lang.annotation.Target;
  *     <li>{@link String} becomes {@code CCharPointer}; a returned string is {@code malloc}-ed and must be
  *     released by the caller with {@code free()}</li>
  *     <li>any other reference type becomes an {@code ObjectHandle} from {@code ObjectHandles.getGlobal()}</li>
+ *     <li>a {@code java.util.function.Consumer} parameter {@code listener} becomes three: a function pointer
+ *     {@code void listener(graal_isolatethread_t *, value, void *userData)}, the {@code void *listenerData} passed back
+ *     to it, and an optional {@code void listenerFree(void *userData)}. The Java code may call it any number of times,
+ *     from any thread. Its value is a {@code const char *} for {@code String}, the primitive for a boxed type (null
+ *     arriving as 0 or false), or else an {@code ObjectHandle}; strings and handles are only valid until the callback
+ *     returns. {@code listenerFree}, when not NULL, is called with the user data once the Java code no longer holds the
+ *     listener, which may be never.</li>
  *     <li>for instance methods, the receiver is passed as a leading {@code ObjectHandle} parameter</li>
  * </ul>
  * If the enclosing class is annotated with {@code @CHeader}, it is copied onto the generated class.

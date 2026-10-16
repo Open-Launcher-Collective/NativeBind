@@ -97,6 +97,12 @@ public class NativeBindProcessor extends AbstractProcessor {
             if (!isWrappable(method, "@GenerateNativeWrapper")) {
                 continue;
             }
+            try {
+                generator.checkListeners(method);
+            } catch (IllegalArgumentException e) {
+                error(method, e.getMessage());
+                continue;
+            }
 
             GenerateNativeWrapper annotation = method.getAnnotation(GenerateNativeWrapper.class);
             String prefix = annotation.prefix().isEmpty() ? defaultPrefix : annotation.prefix();

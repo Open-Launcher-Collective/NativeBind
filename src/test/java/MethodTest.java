@@ -268,6 +268,135 @@ import java.util.Map;
     }
 
     @Test
+    public void wrapsConsumersAsCCallbacks() throws IOException {
+        Result result = compile(List.of(), "demo.Events", """
+                package demo;
+
+                import java.util.function.Consumer;
+                import me.judge.nativebind.GenerateNativeWrapper;
+
+                public class Events {
+                    /** Reports status changes. */
+                    @GenerateNativeWrapper(prefix = "lib")
+                    public static void onStatus(Consumer<String> listener) {}
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    public static void onProgress(Consumer<? super Integer> listener, String listenerData) {}
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    public void onChange(Consumer<Events> changed, Consumer<Boolean> ready) {}
+                }
+                """);
+        assertTrue(result.success(), result.errors());
+
+        String c = result.source("demo/EventsCEntryPoints.java");
+        // Each Consumer becomes a callback, the user data handed back to it, and an optional release hook
+        assertTrue(c.contains("public static void libOnStatus(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, StringListener listener, VoidPointer listenerData, ListenerFree listenerFree)"), c);
+        assertTrue(c.contains("Events.onStatus((Consumer) nativeBind$toStringListener(listener, listenerData, listenerFree));"), c);
+        assertTrue(c.contains("\"Reports status changes.\", \"listener(thread, value, listenerData) is called on every notification"), c);
+        assertTrue(c.contains("\"The string value is only valid until listener returns.\""), c);
+        assertTrue(c.contains("\"If listenerFree is not NULL, it is called with listenerData once the Java code no longer holds the listener, which may be never.\""), c);
+        // Generated names step around the method's own parameters
+        assertTrue(c.contains("public static void libOnProgress(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, IntListener listener, VoidPointer listenerData_, ListenerFree listenerFree, CCharPointer listenerData)"), c);
+        assertTrue(c.contains("public static void libOnChange(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle self, HandleListener changed, VoidPointer changedData, ListenerFree changedFree, BooleanListener ready, VoidPointer readyData, ListenerFree readyFree)"), c);
+        assertTrue(c.contains("\"The handle value is only valid until changed returns, and must not be released.\""), c);
+        assertTrue(c.contains("\"A null value arrives as 0.\""), c);
+        assertTrue(c.contains("\"A null value arrives as false.\""), c);
+
+        assertTrue(c.contains("public interface StringListener extends CFunctionPointer { @InvokeCFunctionPointer void invoke(IsolateThread thread, CCharPointer value, VoidPointer userData);"), c);
+        assertTrue(c.contains("public interface IntListener extends CFunctionPointer { @InvokeCFunctionPointer void invoke(IsolateThread thread, int value, VoidPointer userData);"), c);
+        assertTrue(c.contains("public interface HandleListener extends CFunctionPointer { @InvokeCFunctionPointer void invoke(IsolateThread thread, ObjectHandle value, VoidPointer userData);"), c);
+        assertTrue(c.contains("public interface ListenerFree extends CFunctionPointer { @InvokeCFunctionPointer void invoke(VoidPointer userData);"), c);
+
+        // Strings and handles are lent for the duration of the call only
+        assertTrue(c.contains("private static Consumer<String> nativeBind$toStringListener(StringListener listener, VoidPointer userData, ListenerFree free)"), c);
+        assertTrue(c.contains("CCharPointer cValue = nativeBind$toCString(value); try { WordFactory.<StringListener>pointer(listenerAddress).invoke(CurrentIsolate.getCurrentThread(), cValue, WordFactory.pointer(userDataAddress)); } finally { if (cValue.isNonNull()) { UnmanagedMemory.free(cValue); } }"), c);
+        assertTrue(c.contains("ObjectHandle handle = nativeBind$toHandle(value); try {"), c);
+        assertTrue(c.contains("ObjectHandles.getGlobal().destroy(handle);"), c);
+        assertTrue(c.contains(".invoke(CurrentIsolate.getCurrentThread(), value == null ? (int) 0 : value, WordFactory.pointer(userDataAddress))"), c);
+        assertTrue(c.contains(".invoke(CurrentIsolate.getCurrentThread(), value != null && value, WordFactory.pointer(userDataAddress))"), c);
+        // The user data is released through the hook once Java drops the listener
+        assertTrue(c.contains("NativeBindCleaner.CLEANER.register(listener, () -> WordFactory.<ListenerFree>pointer(freeAddress).invoke(WordFactory.pointer(userDataAddress)));"), c);
+        assertTrue(c.contains("private static final class NativeBindCleaner { static final Cleaner CLEANER = Cleaner.create();"), c);
+    }
+
+    @Test
+    public void wrapsConsumersAsJvmFunctionalInterfaces() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), "demo.Events", """
+                package demo;
+
+                import java.util.function.Consumer;
+                import me.judge.nativebind.GenerateJNIWrapper;
+
+                public class Events {
+                    @GenerateJNIWrapper
+                    public static void onStatus(Consumer<String> listener) {}
+
+                    @GenerateJNIWrapper
+                    public static void onProgress(Consumer<Integer> listener) {}
+
+                    @GenerateJNIWrapper
+                    public static void onChange(Consumer<Events> listener) {}
+                }
+                """);
+        assertTrue(result.success(), result.errors());
+
+        String jvm = result.source("demo/jvm/Entrypoints.java");
+        assertTrue(jvm.contains("public static native void onStatus(Consumer<String> listener, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native void onProgress(Consumer<Integer> listener, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native void onChange(LongConsumer listener, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("{@code listener} is called on whichever thread the native code notifies it from"), jvm);
+        assertTrue(jvm.contains("The handle it receives is only valid during the call, and must not be released."), jvm);
+        assertFalse(jvm.contains("org.graalvm"), jvm);
+
+        String jni = result.source("demo/EventsJNIEntryPoints.java");
+        assertTrue(jni.contains("public static void Java_demo_jvm_Entrypoints_onStatus(JNI.JNIEnv env, JNI.JClass clazz, JNI.JObject listener, @CEntryPoint.IsolateThreadContext IsolateThread isolateThread)"), jni);
+        assertTrue(jni.contains("Events.onStatus((Consumer) nativeBind$toStringListener(env, listener));"), jni);
+        // The JVM object outlives the call through a global reference, released once the Consumer is unreachable
+        assertTrue(jni.contains("long reference = JNIUtil.NewGlobalRef(env, listener, \"NativeBind listener\").rawValue();"), jni);
+        assertTrue(jni.contains("JNIUtil.DeleteGlobalRef(current, WordFactory.pointer(listener));"), jni);
+        assertTrue(jni.contains("long method = nativeBind$listenerMethod(env, \"java/util/function/Consumer\", \"(Ljava/lang/Object;)V\").rawValue();"), jni);
+        assertTrue(jni.contains("long method = nativeBind$listenerMethod(env, \"java/util/function/LongConsumer\", \"(J)V\").rawValue();"), jni);
+        // Only threads the JVM reports as detached are attached, and only for the call. The version is one Android's
+        // ART accepts: with jniutils' JNI_VERSION_10, ART fails GetEnv, and a running JVM thread would be detached
+        assertTrue(jni.contains("int status = javaVM.getFunctions().getGetEnv().call(javaVM, envPointer, 0x00010006);"), jni);
+        assertTrue(jni.contains("boolean attached = status == JNI.JNI_EDETACHED;"), jni);
+        assertTrue(jni.contains("attachArgs.setVersion(0x00010006);"), jni);
+        assertTrue(jni.contains("status = javaVM.getFunctions().getAttachCurrentThreadAsDaemon().call(javaVM, envPointer, attachArgs);"), jni);
+        assertTrue(jni.contains("if (status != JNI.JNI_OK) {"), jni);
+        assertFalse(jni.contains("JNIUtil.GetEnv"), jni);
+        assertFalse(jni.contains("JNIUtil.attachCurrentThread"), jni);
+        assertTrue(jni.contains("if (attached) { JNIUtil.DetachCurrentThread(javaVM); }"), jni);
+        assertTrue(jni.contains("args.setJObject(JNIUtil.createHSString(current, value));"), jni);
+        assertTrue(jni.contains("primitive.setInt(value); args.setJObject(nativeBind$box(current, \"java/lang/Integer\", \"(I)Ljava/lang/Integer;\", primitive));"), jni);
+        assertTrue(jni.contains("args.setLong(handle.rawValue());"), jni);
+        // What the listener throws is reported and cleared rather than left pending
+        assertTrue(jni.contains("nativeBind$warnIfThrown(current);"), jni);
+        assertTrue(jni.contains("JNIUtil.ExceptionDescribe(env); JNIUtil.ExceptionClear(env);"), jni);
+    }
+
+    @Test
+    public void rejectsConsumersOfWords() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.class=demo.Natives"), "demo.Api", """
+                package demo;
+
+                import java.util.function.Consumer;
+                import org.graalvm.nativeimage.c.type.CCharPointer;
+
+                public class Api {
+                    @me.judge.nativebind.GenerateNativeWrapper(prefix = "lib")
+                    public static void c(Consumer<CCharPointer> listener) {}
+
+                    @me.judge.nativebind.GenerateJNIWrapper
+                    public static void jni(Consumer<CCharPointer> listener) {}
+                }
+                """);
+        assertFalse(result.success());
+        String errors = result.errors();
+        assertEquals(2, errors.lines().filter(l -> l.contains("Consumer<org.graalvm.nativeimage.c.type.CCharPointer> cannot be wrapped: word values cannot be boxed")).count(), errors);
+    }
+
+    @Test
     public void generatesOneSupportClassForManyWrappedClasses() throws IOException {
         Result result = compile(List.of(), Map.of(
                 "demo.a.First", """

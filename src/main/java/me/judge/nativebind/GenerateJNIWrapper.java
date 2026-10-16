@@ -35,6 +35,11 @@ import java.lang.annotation.Target;
  *     <li>a {@code JNI.JNIEnv} parameter receives the caller's environment and does not appear on the JVM side</li>
  *     <li>other {@code WordBase} types (pointers, {@code ObjectHandle}) / {@code long}</li>
  *     <li>any other reference type / a {@code long} {@code ObjectHandle} from {@code ObjectHandles.getGlobal()}</li>
+ *     <li>{@code java.util.function.Consumer<String>}, or of a boxed type / the same {@code Consumer}; a {@code Consumer}
+ *     of any other type / a {@code LongConsumer} receiving handles that are only valid during the call. The native code
+ *     may call it any number of times, from any thread: threads the JVM does not know are attached as daemons for the
+ *     call and detached afterwards. Anything the listener throws is printed as a warning and cleared. The JVM object
+ *     is held through a global reference until the native code no longer holds the listener.</li>
  *     <li>for instance methods, the receiver is passed as a leading {@code long} handle</li>
  * </ul>
  * Each call runs inside a {@code JNIMethodScope}. Any exception is rethrown in the JVM as a

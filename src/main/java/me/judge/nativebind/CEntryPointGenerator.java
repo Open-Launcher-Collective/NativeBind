@@ -6,6 +6,7 @@ import com.palantir.javapoet.CodeBlock;
 import com.palantir.javapoet.JavaFile;
 import com.palantir.javapoet.MethodSpec;
 import com.palantir.javapoet.ParameterSpec;
+import com.palantir.javapoet.ParameterizedTypeName;
 import com.palantir.javapoet.TypeName;
 import com.palantir.javapoet.TypeSpec;
 
@@ -24,11 +25,13 @@ import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletionStage;
 
 /**
@@ -62,6 +65,9 @@ final class CEntryPointGenerator {
     private static final ClassName INVOKE_C_FUNCTION_POINTER = ClassName.get("org.graalvm.nativeimage.c.function", "InvokeCFunctionPointer");
     private static final ClassName VOID_POINTER = ClassName.get("org.graalvm.nativeimage.c.type", "VoidPointer");
     private static final ClassName CURRENT_ISOLATE = ClassName.get("org.graalvm.nativeimage", "CurrentIsolate");
+    private static final String LISTENER = "Listener";
+    private static final String LISTENER_FREE = "ListenerFree";
+    private static final String FREE_WHEN_UNREACHABLE = "nativeBind$freeWhenUnreachable";
 
     /** How a Java value crosses the C boundary. */
     enum Mapping {
@@ -103,6 +109,15 @@ final class CEntryPointGenerator {
         this.wordBaseType = wordBase.asType();
     }
 
+    Listener listenerOf(TypeMirror type) {
+        return Listener.of(type, types, elements, wordBaseType);
+    }
+
+    /** Throws {@link IllegalArgumentException} for a {@code Consumer} parameter whose values cannot reach native code. */
+    void checkListeners(ExecutableElement method) {
+        method.getParameters().forEach(p -> listenerOf(p.asType()));
+    }
+
     Mapping mappingOf(TypeMirror type) {
         TypeKind kind = type.getKind();
         if (kind == TypeKind.VOID) {
@@ -131,10 +146,15 @@ final class CEntryPointGenerator {
             clazz.addAnnotation(AnnotationSpec.get(header));
         }
 
+        ClassName generated = ClassName.get(packageName, generatedSimpleName(owner));
         Set<Mapping> used = EnumSet.noneOf(Mapping.class);
         Set<Mapping> usedReturns = EnumSet.noneOf(Mapping.class);
+        Map<String, Listener> listeners = new TreeMap<>();
         for (Entry entry : entries) {
-            clazz.addMethod(wrapper(owner, entry, releaseHandleSymbol, used, usedReturns));
+            clazz.addMethod(wrapper(owner, generated, entry, releaseHandleSymbol, used, usedReturns, listeners));
+        }
+        if (!listeners.isEmpty()) {
+            addListeners(clazz, generated, listeners.values(), usedReturns);
         }
         addHelpers(clazz, used, usedReturns);
 
@@ -293,7 +313,8 @@ final class CEntryPointGenerator {
         return name.append(CLASS_SUFFIX).toString();
     }
 
-    private MethodSpec wrapper(TypeElement owner, Entry entry, String releaseHandleSymbol, Set<Mapping> usedParams, Set<Mapping> usedReturns) {
+    private MethodSpec wrapper(TypeElement owner, ClassName generated, Entry entry, String releaseHandleSymbol,
+                               Set<Mapping> usedParams, Set<Mapping> usedReturns, Map<String, Listener> listeners) {
         ExecutableElement method = entry.method();
         TypeMirror returnType = Wrapped.returnType(method);
 
@@ -310,7 +331,6 @@ final class CEntryPointGenerator {
         String javaName = SourceVersion.isKeyword(entry.symbol()) ? entry.symbol() + "_" : entry.symbol();
         MethodSpec.Builder builder = MethodSpec.methodBuilder(javaName)
                 .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
-                .addAnnotation(entryPointAnnotation(entry, returnMapping, releaseHandleSymbol))
                 .returns(returnMapping.cType(returnType))
                 .addParameter(ParameterSpec.builder(ISOLATE_THREAD, threadParam)
                         .addAnnotation(ISOLATE_THREAD_CONTEXT)
@@ -321,11 +341,26 @@ final class CEntryPointGenerator {
         }
 
         List<CodeBlock> args = new ArrayList<>();
+        List<String> listenerDocs = new ArrayList<>();
         for (VariableElement p : method.getParameters()) {
             TypeMirror type = p.asType();
+            String name = p.getSimpleName().toString();
+            Listener listener = listenerOf(type);
+            if (listener != null) {
+                // A Consumer arrives as a callback, the user data handed back to it, and an optional release hook
+                String suffix = listener.suffix(types);
+                listeners.putIfAbsent(suffix, listener);
+                String data = unique(name + "Data", taken);
+                String free = unique(name + "Free", taken);
+                builder.addParameter(generated.nestedClass(suffix + LISTENER), name)
+                        .addParameter(VOID_POINTER, data)
+                        .addParameter(generated.nestedClass(LISTENER_FREE), free);
+                args.add(CodeBlock.of("($T) $N($N, $N, $N)", Listener.CONSUMER, listenerFactory(suffix), name, data, free));
+                listenerDocs.addAll(listenerDocumentation(listener, name, data, free));
+                continue;
+            }
             Mapping mapping = mappingOf(type);
             usedParams.add(mapping);
-            String name = p.getSimpleName().toString();
             builder.addParameter(mapping.cType(type), name);
             args.add(switch (mapping) {
                 case VOID, PASS_THROUGH -> CodeBlock.of("$N", name);
@@ -336,6 +371,7 @@ final class CEntryPointGenerator {
         for (TypeMirror thrown : method.getThrownTypes()) {
             builder.addException(TypeName.get(thrown));
         }
+        builder.addAnnotation(entryPointAnnotation(entry, returnMapping, releaseHandleSymbol, listenerDocs));
 
         CodeBlock call;
         if (Wrapped.isConstructor(method)) {
@@ -356,10 +392,10 @@ final class CEntryPointGenerator {
         return builder.build();
     }
 
-    private AnnotationSpec entryPointAnnotation(Entry entry, Mapping returnMapping, String releaseHandleSymbol) {
+    private AnnotationSpec entryPointAnnotation(Entry entry, Mapping returnMapping, String releaseHandleSymbol, List<String> listenerDocs) {
         AnnotationSpec.Builder annotation = AnnotationSpec.builder(C_ENTRY_POINT).addMember("name", "$S", entry.symbol());
 
-        List<String> docs = documentation(entry.method(), returnMapping, releaseHandleSymbol);
+        List<String> docs = documentation(entry.method(), returnMapping, releaseHandleSymbol, listenerDocs);
         if (!docs.isEmpty()) {
             CodeBlock lines = CodeBlock.join(docs.stream().map(line -> CodeBlock.of("$S", line)).toList(), ", ");
             annotation.addMember("documentation", docs.size() == 1 ? "$L" : "{$L}", lines);
@@ -370,8 +406,8 @@ final class CEntryPointGenerator {
         return annotation.build();
     }
 
-    /** The method's Javadoc, one entry per line, followed by ownership notes for the returned value. */
-    private List<String> documentation(ExecutableElement method, Mapping returnMapping, String releaseHandleSymbol) {
+    /** The method's Javadoc, one entry per line, followed by how listeners are called and ownership notes for the returned value. */
+    private List<String> documentation(ExecutableElement method, Mapping returnMapping, String releaseHandleSymbol, List<String> listenerDocs) {
         List<String> lines = new ArrayList<>();
         String doc = elements.getDocComment(method);
         if (doc != null) {
@@ -379,12 +415,135 @@ final class CEntryPointGenerator {
                 lines.add(line.strip());
             }
         }
+        lines.addAll(listenerDocs);
         if (returnMapping == Mapping.STRING) {
             lines.add("The returned string is allocated with malloc and must be released by the caller with free().");
         } else if (returnMapping == Mapping.HANDLE) {
             lines.add("The returned handle keeps its object alive until it is passed to " + releaseHandleSymbol + "().");
         }
         return lines;
+    }
+
+    private List<String> listenerDocumentation(Listener listener, String name, String data, String free) {
+        List<String> lines = new ArrayList<>();
+        lines.add(name + "(thread, value, " + data + ") is called on every notification, on the notifying thread; thread may be used to call back into the isolate. A NULL " + name + " passes null to the Java code.");
+        lines.add(switch (listener.kind()) {
+            case STRING -> "The string value is only valid until " + name + " returns.";
+            case HANDLE -> "The handle value is only valid until " + name + " returns, and must not be released.";
+            case BOXED -> "A null value arrives as " + (listener.primitive(types) == TypeKind.BOOLEAN ? "false." : "0.");
+        });
+        lines.add("If " + free + " is not NULL, it is called with " + data + " once the Java code no longer holds the listener, which may be never.");
+        return lines;
+    }
+
+    private static String listenerFactory(String suffix) {
+        return "nativeBind$to" + suffix + LISTENER;
+    }
+
+    /**
+     * Declares the callback type and {@code Consumer} factory for each kind of listener the wrappers take, and the
+     * hook that releases a listener's user data once its {@code Consumer} is unreachable.
+     */
+    private void addListeners(TypeSpec.Builder clazz, ClassName generated, Collection<Listener> listeners, Set<Mapping> usedReturns) {
+        ClassName free = generated.nestedClass(LISTENER_FREE);
+        clazz.addType(TypeSpec.interfaceBuilder(LISTENER_FREE)
+                .addModifiers(Modifier.PUBLIC)
+                .addJavadoc("{@code void (*)(void *userData)}, called once a listener's {@code Consumer} is unreachable, so that its user data can be released.\n")
+                .addSuperinterface(C_FUNCTION_POINTER)
+                .addMethod(MethodSpec.methodBuilder("invoke")
+                        .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
+                        .addAnnotation(INVOKE_C_FUNCTION_POINTER)
+                        .addParameter(VOID_POINTER, "userData")
+                        .build())
+                .build());
+        clazz.addType(Listener.cleanerHolder());
+        clazz.addMethod(MethodSpec.methodBuilder(FREE_WHEN_UNREACHABLE)
+                .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                .addParameter(Object.class, "listener")
+                .addParameter(free, "free")
+                .addParameter(VOID_POINTER, "userData")
+                .beginControlFlow("if (free.isNonNull())")
+                .addStatement("long freeAddress = free.rawValue()")
+                .addStatement("long userDataAddress = userData.rawValue()")
+                .addStatement("$T.CLEANER.register(listener, () -> $T.<$T>pointer(freeAddress).invoke($T.pointer(userDataAddress)))",
+                        generated.nestedClass(Listener.CLEANER_HOLDER), WORD_FACTORY, free, WORD_FACTORY)
+                .endControlFlow()
+                .build());
+
+        for (Listener listener : listeners) {
+            String suffix = listener.suffix(types);
+            ClassName callback = generated.nestedClass(suffix + LISTENER);
+            TypeName cValue = switch (listener.kind()) {
+                case STRING -> C_CHAR_POINTER;
+                case BOXED -> TypeName.get(types.getPrimitiveType(listener.primitive(types)));
+                case HANDLE -> OBJECT_HANDLE;
+            };
+            clazz.addType(TypeSpec.interfaceBuilder(callback.simpleName())
+                    .addModifiers(Modifier.PUBLIC)
+                    .addJavadoc("{@code void (*)(graal_isolatethread_t *thread, $L value, void *userData)}, notified through a {@code Consumer<$L>}.\n",
+                            listener.kind() == Listener.Kind.STRING ? "const char *" : cValue, TypeName.get(listener.valueType()))
+                    .addSuperinterface(C_FUNCTION_POINTER)
+                    .addMethod(MethodSpec.methodBuilder("invoke")
+                            .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
+                            .addAnnotation(INVOKE_C_FUNCTION_POINTER)
+                            .addParameter(ISOLATE_THREAD, "thread")
+                            .addParameter(cValue, "value")
+                            .addParameter(VOID_POINTER, "userData")
+                            .build())
+                    .build());
+
+            CodeBlock.Builder notify = CodeBlock.builder();
+            switch (listener.kind()) {
+                case STRING -> {
+                    usedReturns.add(Mapping.STRING);
+                    notify.addStatement("$T cValue = $N(value)", C_CHAR_POINTER, TO_C_STRING)
+                            .beginControlFlow("try")
+                            .addStatement("$L", invokeListener(callback, CodeBlock.of("cValue")))
+                            .nextControlFlow("finally")
+                            .beginControlFlow("if (cValue.isNonNull())")
+                            .addStatement("$T.free(cValue)", UNMANAGED_MEMORY)
+                            .endControlFlow()
+                            .endControlFlow();
+                }
+                case BOXED -> notify.addStatement("$L", invokeListener(callback, Listener.unboxedOrZero(listener.primitive(types), "value")));
+                case HANDLE -> {
+                    usedReturns.add(Mapping.HANDLE);
+                    notify.addStatement("$T handle = $N(value)", OBJECT_HANDLE, TO_HANDLE)
+                            .beginControlFlow("try")
+                            .addStatement("$L", invokeListener(callback, CodeBlock.of("handle")))
+                            .nextControlFlow("finally")
+                            .beginControlFlow("if (handle.notEqual($T.zero()))", WORD_FACTORY)
+                            .addStatement("$T.getGlobal().destroy(handle)", OBJECT_HANDLES)
+                            .endControlFlow()
+                            .endControlFlow();
+                }
+            }
+
+            TypeName consumer = ParameterizedTypeName.get(Listener.CONSUMER, listener.javaType());
+            clazz.addMethod(MethodSpec.methodBuilder(listenerFactory(suffix))
+                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                    .returns(consumer)
+                    .addParameter(callback, "listener")
+                    .addParameter(VOID_POINTER, "userData")
+                    .addParameter(free, "free")
+                    .beginControlFlow("if (listener.isNull())")
+                    .addStatement("return null")
+                    .endControlFlow()
+                    // Word values cannot be captured by the lambda's object, so they cross it as raw addresses
+                    .addStatement("long listenerAddress = listener.rawValue()")
+                    .addStatement("long userDataAddress = userData.rawValue()")
+                    .addCode("$T consumer = value -> {\n$>", consumer)
+                    .addCode(notify.build())
+                    .addCode("$<};\n")
+                    .addStatement("$N(consumer, free, userData)", FREE_WHEN_UNREACHABLE)
+                    .addStatement("return consumer")
+                    .build());
+        }
+    }
+
+    private static CodeBlock invokeListener(ClassName callback, CodeBlock value) {
+        return CodeBlock.of("$T.<$T>pointer(listenerAddress).invoke($T.getCurrentThread(), $L, $T.pointer(userDataAddress))",
+                WORD_FACTORY, callback, CURRENT_ISOLATE, value, WORD_FACTORY);
     }
 
     AnnotationMirror findHeader(TypeElement owner) {

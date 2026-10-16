@@ -28,6 +28,7 @@ import javax.lang.model.util.Types;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -35,7 +36,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongConsumer;
 
 /**
  * Generates {@code @CEntryPoint}s that a JVM binds to {@code native} methods, along with the JVM-side class
@@ -50,6 +53,16 @@ final class JNIEntryPointGenerator {
 
     private static final String JNIUTILS = "org.graalvm.jniutils";
     private static final ClassName JNI_ENV = ClassName.get(JNIUTILS, "JNI", "JNIEnv");
+    private static final ClassName JAVA_VM = ClassName.get(JNIUTILS, "JNI", "JavaVM");
+    private static final ClassName JOBJECT = ClassName.get(JNIUTILS, "JNI", "JObject");
+    private static final ClassName JNI_ENV_POINTER = ClassName.get(JNIUTILS, "JNI", "JNIEnvPointer");
+    private static final ClassName JAVA_VM_ATTACH_ARGS = ClassName.get(JNIUTILS, "JNI", "JavaVMAttachArgs");
+    private static final ClassName JNI_CLASS = ClassName.get(JNIUTILS, "JNI");
+    /**
+     * The newest version Android's ART accepts. jniutils' own {@code GetEnv} and {@code attachCurrentThread} ask for
+     * {@code JNI_VERSION_10}, which ART rejects, so an attached thread would look detached.
+     */
+    private static final String JNI_VERSION_1_6 = "0x00010006";
     private static final ClassName JCLASS = ClassName.get(JNIUTILS, "JNI", "JClass");
     private static final ClassName JSTRING = ClassName.get(JNIUTILS, "JNI", "JString");
     private static final ClassName JOBJECT_ARRAY = ClassName.get(JNIUTILS, "JNI", "JObjectArray");
@@ -86,13 +99,17 @@ final class JNIEntryPointGenerator {
     private static final String THROW_IN_JVM = "nativeBind$throwInJvm";
     private static final String CURRENT = "nativeBind$current";
     private static final String EPOCH = "nativeBind$epoch";
+    private static final String LISTENER_METHOD = "nativeBind$listenerMethod";
+    private static final String BOX = "nativeBind$box";
+    private static final String WARN_IF_THROWN = "nativeBind$warnIfThrown";
+    private static final String RELEASE_WHEN_UNREACHABLE = "nativeBind$releaseWhenUnreachable";
 
     /** Non-native methods generated into the JVM class declaring the support natives; user natives may not reuse their names. */
     static final Set<String> JVM_HELPERS = Set.of("openIsolate", "currentIsolateThread", "detachCurrentThread", "closeIsolate");
 
     /** How a Java value crosses the JNI boundary. */
     enum Kind {
-        VOID, PRIMITIVE, STRING, STRING_ARRAY, PRIMITIVE_ARRAY, JNI_REFERENCE, ENV, WORD, HANDLE
+        VOID, PRIMITIVE, STRING, STRING_ARRAY, PRIMITIVE_ARRAY, JNI_REFERENCE, ENV, WORD, HANDLE, LISTENER
     }
 
     /**
@@ -202,10 +219,26 @@ final class JNIEntryPointGenerator {
         return new Mapping(Kind.HANDLE, type, OBJECT_HANDLE, TypeName.LONG, "J");
     }
 
+    Listener listenerOf(TypeMirror type) {
+        return Listener.of(type, types, elements, wordBaseType);
+    }
+
+    /**
+     * A {@code Consumer} parameter arrives as the JVM's own functional interface: {@code Consumer<String>},
+     * {@code Consumer<Integer>} and so on, or a {@code LongConsumer} receiving handles.
+     */
+    private Mapping listenerMapping(TypeMirror type, Listener listener) {
+        TypeName jvmType = listener.kind() == Listener.Kind.HANDLE
+                ? ClassName.get(LongConsumer.class)
+                : ParameterizedTypeName.get(Listener.CONSUMER, listener.javaType());
+        return new Mapping(Kind.LISTENER, type, JOBJECT, jvmType, descriptor(jvmType));
+    }
+
     Signature signature(ExecutableElement method) {
         List<Mapping> params = new ArrayList<>();
         for (VariableElement p : method.getParameters()) {
-            params.add(map(p.asType()));
+            Listener listener = listenerOf(p.asType());
+            params.add(listener == null ? map(p.asType()) : listenerMapping(p.asType(), listener));
         }
         Mapping returns = map(Wrapped.returnType(method));
         if (returns.kind() == Kind.ENV) {
@@ -245,6 +278,18 @@ final class JNIEntryPointGenerator {
             javadoc.append(doc.strip()).append("\n\n");
         }
         javadoc.append("Calls {@code ").append(Wrapped.displayName(method)).append("} in the native image.\n");
+        for (int i = 0; i < signature.params().size(); i++) {
+            Mapping mapping = signature.params().get(i);
+            if (mapping.kind() == Kind.LISTENER) {
+                javadoc.append("{@code ").append(method.getParameters().get(i).getSimpleName())
+                        .append("} is called on whichever thread the native code notifies it from, attached to the JVM for "
+                                + "the call if necessary. Anything it throws is printed as a warning and otherwise ignored.");
+                if (listenerOf(mapping.type()).kind() == Listener.Kind.HANDLE) {
+                    javadoc.append(" The handle it receives is only valid during the call, and must not be released.");
+                }
+                javadoc.append('\n');
+            }
+        }
         if (signature.returns().kind() == Kind.HANDLE) {
             javadoc.append("The returned handle must be passed to {@code releaseHandle} once it is no longer needed.\n");
         }
@@ -325,10 +370,15 @@ final class JNIEntryPointGenerator {
                         .addMember("value", "{$S, $S}", "unchecked", "rawtypes")
                         .build());
 
+        ClassName generated = ClassName.get(elements.getPackageOf(owner).getQualifiedName().toString(), generatedSimpleName(owner));
         Set<Kind> params = EnumSet.noneOf(Kind.class);
         Set<Kind> returns = EnumSet.noneOf(Kind.class);
+        Map<String, Listener> listeners = new TreeMap<>();
         for (Entry entry : entries) {
-            clazz.addMethod(wrapper(owner, entry, params, returns));
+            clazz.addMethod(wrapper(owner, entry, params, returns, listeners));
+        }
+        if (!listeners.isEmpty()) {
+            addListeners(clazz, generated, listeners.values(), returns);
         }
         addHelpers(clazz, params, returns);
         clazz.addMethod(throwInJvm());
@@ -347,7 +397,7 @@ final class JNIEntryPointGenerator {
         return name.append(CLASS_SUFFIX).toString();
     }
 
-    private MethodSpec wrapper(TypeElement owner, Entry entry, Set<Kind> usedParams, Set<Kind> usedReturns) {
+    private MethodSpec wrapper(TypeElement owner, Entry entry, Set<Kind> usedParams, Set<Kind> usedReturns, Map<String, Listener> listeners) {
         ExecutableElement method = entry.method();
         Signature signature = entry.signature();
         Set<String> taken = new HashSet<>();
@@ -381,6 +431,13 @@ final class JNIEntryPointGenerator {
                 continue;
             }
             builder.addParameter(mapping.nativeType(), name);
+            if (mapping.kind() == Kind.LISTENER) {
+                Listener listener = listenerOf(mapping.type());
+                String suffix = listener.suffix(types);
+                listeners.putIfAbsent(suffix, listener);
+                args.add(CodeBlock.of("($T) $N($N, $N)", Listener.CONSUMER, listenerFactory(suffix), env, name));
+                continue;
+            }
             args.add(switch (mapping.kind()) {
                 case STRING -> CodeBlock.of("$T.createString($N, $N)", JNI_UTIL, env, name);
                 case STRING_ARRAY -> CodeBlock.of("$N($N, $N)", TO_STRING_ARRAY, env, name);
@@ -518,6 +575,202 @@ final class JNIEntryPointGenerator {
                     .addStatement("return value == null ? $T.zero() : $T.getGlobal().create(value)", WORD_FACTORY, OBJECT_HANDLES)
                     .build());
         }
+    }
+
+    private static String listenerFactory(String suffix) {
+        return "nativeBind$to" + suffix + "Listener";
+    }
+
+    /**
+     * Adds a factory for each kind of listener the wrappers take, turning a JVM functional interface into a
+     * {@code Consumer} that native code can call from any thread. The JVM object is held through a global reference,
+     * deleted once the {@code Consumer} is unreachable.
+     */
+    private void addListeners(TypeSpec.Builder clazz, ClassName generated, Collection<Listener> listeners, Set<Kind> usedReturns) {
+        clazz.addType(Listener.cleanerHolder());
+        clazz.addMethod(listenerMethod());
+        clazz.addMethod(warnIfThrown());
+        clazz.addMethod(MethodSpec.methodBuilder(RELEASE_WHEN_UNREACHABLE)
+                .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                .addParameter(Object.class, "consumer")
+                .addParameter(long.class, "vm")
+                .addParameter(long.class, "listener")
+                .addCode("$T.CLEANER.register(consumer, () -> {\n$>", generated.nestedClass(Listener.CLEANER_HOLDER))
+                .addCode(enterJvm("release"))
+                .beginControlFlow("try")
+                .addStatement("$T.DeleteGlobalRef(current, $T.pointer(listener))", JNI_UTIL, WORD_FACTORY)
+                .nextControlFlow("finally")
+                .addCode(exitJvm())
+                .endControlFlow()
+                .addCode("$<});\n")
+                .build());
+
+        boolean boxes = false;
+        for (Listener listener : listeners) {
+            String suffix = listener.suffix(types);
+            CodeBlock prelude = CodeBlock.of("");
+            CodeBlock cleanup = CodeBlock.of("");
+            CodeBlock.Builder argument = CodeBlock.builder();
+            switch (listener.kind()) {
+                case STRING -> argument.addStatement("args.setJObject($T.createHSString(current, value))", JNI_UTIL);
+                case BOXED -> {
+                    boxes = true;
+                    TypeKind primitive = listener.primitive(types);
+                    String boxed = elements.getBinaryName((TypeElement) types.asElement(listener.valueType())).toString().replace('.', '/');
+                    argument.beginControlFlow("if (value == null)")
+                            .addStatement("args.setJObject($T.nullPointer())", WORD_FACTORY)
+                            .nextControlFlow("else")
+                            .addStatement("$T primitive = $T.get($T.class)", JVALUE, STACK_VALUE, JVALUE)
+                            .addStatement("primitive.set$L(value)", suffix)
+                            .addStatement("args.setJObject($N(current, $S, $S, primitive))", BOX, boxed,
+                                    "(" + primitiveDescriptor(primitive) + ")L" + boxed + ";")
+                            .endControlFlow();
+                }
+                case HANDLE -> {
+                    usedReturns.add(Kind.HANDLE);
+                    prelude = CodeBlock.builder().addStatement("$T handle = $N(value)", OBJECT_HANDLE, TO_HANDLE).build();
+                    argument.addStatement("args.setLong(handle.rawValue())");
+                    cleanup = CodeBlock.builder()
+                            .beginControlFlow("if (handle.notEqual($T.zero()))", WORD_FACTORY)
+                            .addStatement("$T.getGlobal().destroy(handle)", OBJECT_HANDLES)
+                            .endControlFlow()
+                            .build();
+                }
+            }
+            boolean handles = listener.kind() == Listener.Kind.HANDLE;
+
+            TypeName consumer = ParameterizedTypeName.get(Listener.CONSUMER, listener.javaType());
+            clazz.addMethod(MethodSpec.methodBuilder(listenerFactory(suffix))
+                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                    .returns(consumer)
+                    .addParameter(JNI_ENV, "env")
+                    .addParameter(JOBJECT, "listener")
+                    .beginControlFlow("if (listener.isNull())")
+                    .addStatement("return null")
+                    .endControlFlow()
+                    // Word values cannot be captured by the lambda's object, so they cross it as raw addresses
+                    .addStatement("long vm = $T.GetJavaVM(env).rawValue()", JNI_UTIL)
+                    .addStatement("long method = $N(env, $S, $S).rawValue()", LISTENER_METHOD,
+                            handles ? "java/util/function/LongConsumer" : "java/util/function/Consumer",
+                            handles ? "(J)V" : "(Ljava/lang/Object;)V")
+                    .addStatement("long reference = $T.NewGlobalRef(env, listener, $S).rawValue()", JNI_UTIL, "NativeBind listener")
+                    .addCode("$T consumer = value -> {\n$>", consumer)
+                    .addCode(enterJvm("notify"))
+                    .addCode(prelude)
+                    .beginControlFlow("try")
+                    .beginControlFlow("if ($T.PushLocalFrame(current, 4) != 0)", JNI_UTIL)
+                    .addStatement("$N(current)", WARN_IF_THROWN)
+                    .addStatement("return")
+                    .endControlFlow()
+                    .beginControlFlow("try")
+                    .addStatement("$T args = $T.get($T.class)", JVALUE, STACK_VALUE, JVALUE)
+                    .addCode(argument.build())
+                    .addStatement("current.getFunctions().getCallVoidMethodA().call(current, $T.pointer(reference), $T.pointer(method), args)",
+                            WORD_FACTORY, WORD_FACTORY)
+                    .addStatement("$N(current)", WARN_IF_THROWN)
+                    .nextControlFlow("finally")
+                    .addStatement("$T.PopLocalFrame(current, $T.nullPointer())", JNI_UTIL, WORD_FACTORY)
+                    .endControlFlow()
+                    .nextControlFlow("finally")
+                    .addCode(cleanup)
+                    .addCode(exitJvm())
+                    .endControlFlow()
+                    .addCode("$<};\n")
+                    .addStatement("$N(consumer, vm, reference)", RELEASE_WHEN_UNREACHABLE)
+                    .addStatement("return consumer")
+                    .build());
+        }
+        if (boxes) {
+            clazz.addMethod(box());
+        }
+    }
+
+    /**
+     * Declares {@code current}, the calling thread's {@code JNIEnv} in the JVM at address {@code vm}. Only a thread
+     * the JVM reports as detached, such as one started in the native image, is attached, as a daemon, for the
+     * duration ({@code attached}): detaching a JVM thread that is running Java code aborts the process. The code
+     * returns early, warning that it could not {@code action} the listener, if no {@code JNIEnv} is available.
+     */
+    private static CodeBlock enterJvm(String action) {
+        return CodeBlock.builder()
+                .addStatement("$T javaVM = $T.pointer(vm)", JAVA_VM, WORD_FACTORY)
+                .addStatement("$T envPointer = $T.get($T.class)", JNI_ENV_POINTER, STACK_VALUE, JNI_ENV_POINTER)
+                .addStatement("int status = javaVM.getFunctions().getGetEnv().call(javaVM, envPointer, $L)", JNI_VERSION_1_6)
+                .addStatement("boolean attached = status == $T.JNI_EDETACHED", JNI_CLASS)
+                .beginControlFlow("if (attached)")
+                .addStatement("$T attachArgs = $T.get($T.class)", JAVA_VM_ATTACH_ARGS, STACK_VALUE, JAVA_VM_ATTACH_ARGS)
+                .addStatement("attachArgs.setVersion($L)", JNI_VERSION_1_6)
+                .addStatement("attachArgs.setName($T.nullPointer())", WORD_FACTORY)
+                .addStatement("attachArgs.setGroup($T.nullPointer())", WORD_FACTORY)
+                .addStatement("status = javaVM.getFunctions().getAttachCurrentThreadAsDaemon().call(javaVM, envPointer, attachArgs)")
+                .endControlFlow()
+                .beginControlFlow("if (status != $T.JNI_OK)", JNI_CLASS)
+                .addStatement("$T.err.println($S + $T.currentThread().getName() + $S + status + $S)", System.class,
+                        "[NativeBind] warning: could not get a JNIEnv for ", Thread.class,
+                        " to " + action + " a listener (JNI error ", ")")
+                .addStatement("return")
+                .endControlFlow()
+                .addStatement("$T current = envPointer.readJNIEnv()", JNI_ENV)
+                .build();
+    }
+
+    /** Detaches a thread {@link #enterJvm()} attached; the JVM (Android's in particular) must not outlive it attached. */
+    private static CodeBlock exitJvm() {
+        return CodeBlock.builder()
+                .beginControlFlow("if (attached)")
+                .addStatement("$T.DetachCurrentThread(javaVM)", JNI_UTIL)
+                .endControlFlow()
+                .build();
+    }
+
+    /** The {@code accept} method of the JVM interface {@code type}, through which every implementation is called. */
+    private static MethodSpec listenerMethod() {
+        return MethodSpec.methodBuilder(LISTENER_METHOD)
+                .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                .returns(JMETHOD_ID)
+                .addParameter(JNI_ENV, "env")
+                .addParameter(String.class, "type")
+                .addParameter(String.class, "descriptor")
+                .addStatement("$T consumer = $T.findClass(env, type)", JCLASS, JNI_UTIL)
+                .beginControlFlow("try ($T name = $T.toCString($S); $T signature = $T.toCString(descriptor))",
+                        C_CHAR_POINTER_HOLDER, C_TYPE_CONVERSION, "accept", C_CHAR_POINTER_HOLDER, C_TYPE_CONVERSION)
+                .addStatement("return $T.GetMethodID(env, consumer, name.get(), signature.get())", JNI_UTIL)
+                .nextControlFlow("finally")
+                .addStatement("$T.DeleteLocalRef(env, consumer)", JNI_UTIL)
+                .endControlFlow()
+                .build();
+    }
+
+    /** Boxes {@code value} in the JVM with the static {@code valueOf} of {@code type}, e.g. {@code java/lang/Integer}. */
+    private static MethodSpec box() {
+        return MethodSpec.methodBuilder(BOX)
+                .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                .returns(JOBJECT)
+                .addParameter(JNI_ENV, "env")
+                .addParameter(String.class, "type")
+                .addParameter(String.class, "descriptor")
+                .addParameter(JVALUE, "value")
+                .addStatement("$T boxed = $T.findClass(env, type)", JCLASS, JNI_UTIL)
+                .addStatement("$T valueOf", JMETHOD_ID)
+                .beginControlFlow("try ($T name = $T.toCString($S); $T signature = $T.toCString(descriptor))",
+                        C_CHAR_POINTER_HOLDER, C_TYPE_CONVERSION, "valueOf", C_CHAR_POINTER_HOLDER, C_TYPE_CONVERSION)
+                .addStatement("valueOf = $T.GetStaticMethodID(env, boxed, name.get(), signature.get())", JNI_UTIL)
+                .endControlFlow()
+                .addStatement("return env.getFunctions().getCallStaticObjectMethodA().call(env, boxed, valueOf, value)")
+                .build();
+    }
+
+    /** A listener must not break the code notifying it, so what it throws is reported and cleared. */
+    private static MethodSpec warnIfThrown() {
+        return MethodSpec.methodBuilder(WARN_IF_THROWN)
+                .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                .addParameter(JNI_ENV, "env")
+                .beginControlFlow("if ($T.ExceptionCheck(env))", JNI_UTIL)
+                .addStatement("$T.err.println($S)", System.class, "[NativeBind] warning: a listener threw an exception, which was ignored:")
+                .addStatement("$T.ExceptionDescribe(env)", JNI_UTIL)
+                .addStatement("$T.ExceptionClear(env)", JNI_UTIL)
+                .endControlFlow()
+                .build();
     }
 
     /** The library-wide isolate lifecycle and handle release entry points; generated once per compilation. */
