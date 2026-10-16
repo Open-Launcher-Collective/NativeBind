@@ -472,6 +472,8 @@ import java.util.Map;
         assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_createIsolate\", builtin = CEntryPoint.Builtin.CREATE_ISOLATE)"), support);
         assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_tearDownIsolate\", builtin = CEntryPoint.Builtin.TEAR_DOWN_ISOLATE)"), support);
         assertTrue(support.contains("@CEntryPoint(name = \"Java_demo_jvm_Entrypoints_releaseHandle\")"), support);
+        // Errors reach the JVM with their native stack trace and causes, not just the outermost message
+        assertTrue(support.contains("error.printStackTrace(new PrintWriter(trace));"), support);
 
         assertTrue(result.source("demo/NativeBindJNIFeature.java").contains("ImageSingletons.add(NativeBridgeSupport.class, new NativeBindJNIBridgeSupport());"));
         String properties = Files.readString(result.classes().resolve("META-INF/native-image/nativebind/demo/native-image.properties"));

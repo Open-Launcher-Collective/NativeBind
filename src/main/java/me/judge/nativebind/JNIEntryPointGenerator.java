@@ -24,6 +24,8 @@ import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -398,9 +400,10 @@ final class JNIEntryPointGenerator {
     }
 
     /**
-     * Raises {@code error} in the JVM as a {@code java.lang.RuntimeException} using nothing but core JNI, so the JVM
-     * side never needs jniutils (which, unlike {@code JNIExceptionWrapper}, keeps this working on Android). An
-     * exception already pending in the JVM, e.g. thrown by an upcall, is left to propagate unchanged.
+     * Raises {@code error} in the JVM as a {@code java.lang.RuntimeException} whose message holds the native stack
+     * trace, using nothing but core JNI, so the JVM side never needs jniutils (which, unlike
+     * {@code JNIExceptionWrapper}, keeps this working on Android). An exception already pending in the JVM, e.g.
+     * thrown by an upcall, is left to propagate unchanged.
      */
     private static MethodSpec throwInJvm() {
         return MethodSpec.methodBuilder(THROW_IN_JVM)
@@ -411,7 +414,11 @@ final class JNIEntryPointGenerator {
                 .beginControlFlow("if ($T.ExceptionCheck(env))", JNI_UTIL)
                 .addStatement("return")
                 .endControlFlow()
-                .addStatement("String message = error.getMessage() == null ? error.getClass().getName() : error.getClass().getName() + $S + error.getMessage()", ": ")
+                // The whole native stack trace, causes included: wrappers like ExceptionInInitializerError carry no
+                // message of their own, and the native frames are otherwise lost on the JVM side
+                .addStatement("$T trace = new $T()", StringWriter.class, StringWriter.class)
+                .addStatement("error.printStackTrace(new $T(trace))", PrintWriter.class)
+                .addStatement("String message = trace.toString().stripTrailing()")
                 .addStatement("$T type = $T.findClass(env, $S)", JCLASS, JNI_UTIL, "java/lang/RuntimeException")
                 .addStatement("$T constructor", JMETHOD_ID)
                 .beginControlFlow("try ($T name = $T.toCString($S); $T signature = $T.toCString($S))",
