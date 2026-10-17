@@ -14,7 +14,6 @@ import javax.annotation.processing.ProcessingEnvironment;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
-import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.PackageElement;
 import javax.lang.model.element.TypeElement;
@@ -82,7 +81,7 @@ final class CEntryPointGenerator {
         }
     }
 
-    record Entry(ExecutableElement method, String symbol, TypeMirror exceptionHandler) {
+    record Entry(Wrapped member, String symbol, TypeMirror exceptionHandler) {
     }
 
     /** {@code builtins} maps each name from {@link #builtinNames()} to its exported symbol. */
@@ -114,8 +113,8 @@ final class CEntryPointGenerator {
     }
 
     /** Throws {@link IllegalArgumentException} for a {@code Consumer} parameter whose values cannot reach native code. */
-    void checkListeners(ExecutableElement method) {
-        method.getParameters().forEach(p -> listenerOf(p.asType()));
+    void checkListeners(Wrapped member) {
+        member.parameters().forEach(p -> listenerOf(p.asType()));
     }
 
     Mapping mappingOf(TypeMirror type) {
@@ -315,15 +314,15 @@ final class CEntryPointGenerator {
 
     private MethodSpec wrapper(TypeElement owner, ClassName generated, Entry entry, String releaseHandleSymbol,
                                Set<Mapping> usedParams, Set<Mapping> usedReturns, Map<String, Listener> listeners) {
-        ExecutableElement method = entry.method();
-        TypeMirror returnType = Wrapped.returnType(method);
+        Wrapped member = entry.member();
+        TypeMirror returnType = member.returnType(types);
 
         Set<String> taken = new HashSet<>();
-        for (VariableElement p : method.getParameters()) {
+        for (VariableElement p : member.parameters()) {
             taken.add(p.getSimpleName().toString());
         }
         String threadParam = unique("isolateThread", taken);
-        String selfParam = Wrapped.hasReceiver(method) ? unique("self", taken) : null;
+        String selfParam = member.hasReceiver() ? unique("self", taken) : null;
 
         Mapping returnMapping = mappingOf(returnType);
         usedReturns.add(returnMapping);
@@ -342,7 +341,7 @@ final class CEntryPointGenerator {
 
         List<CodeBlock> args = new ArrayList<>();
         List<String> listenerDocs = new ArrayList<>();
-        for (VariableElement p : method.getParameters()) {
+        for (VariableElement p : member.parameters()) {
             TypeMirror type = p.asType();
             String name = p.getSimpleName().toString();
             Listener listener = listenerOf(type);
@@ -368,20 +367,15 @@ final class CEntryPointGenerator {
                 case HANDLE -> CodeBlock.of("($T) $N($N)", TypeName.get(types.erasure(type)), FROM_HANDLE, name);
             });
         }
-        for (TypeMirror thrown : method.getThrownTypes()) {
+        for (TypeMirror thrown : member.thrownTypes()) {
             builder.addException(TypeName.get(thrown));
         }
         builder.addAnnotation(entryPointAnnotation(entry, returnMapping, releaseHandleSymbol, listenerDocs));
 
-        CodeBlock call;
-        if (Wrapped.isConstructor(method)) {
-            call = CodeBlock.of("new $T($L)", ClassName.get(owner), CodeBlock.join(args, ", "));
-        } else {
-            CodeBlock target = selfParam == null
-                    ? CodeBlock.of("$T", ClassName.get(owner))
-                    : CodeBlock.of("(($T) $N($N))", TypeName.get(types.erasure(owner.asType())), FROM_HANDLE, selfParam);
-            call = CodeBlock.of("$L.$N($L)", target, method.getSimpleName().toString(), CodeBlock.join(args, ", "));
-        }
+        CodeBlock receiver = selfParam == null
+                ? null
+                : CodeBlock.of("(($T) $N($N))", TypeName.get(types.erasure(owner.asType())), FROM_HANDLE, selfParam);
+        CodeBlock call = member.call(receiver, args);
 
         switch (returnMapping) {
             case VOID -> builder.addStatement("$L", call);
@@ -395,7 +389,7 @@ final class CEntryPointGenerator {
     private AnnotationSpec entryPointAnnotation(Entry entry, Mapping returnMapping, String releaseHandleSymbol, List<String> listenerDocs) {
         AnnotationSpec.Builder annotation = AnnotationSpec.builder(C_ENTRY_POINT).addMember("name", "$S", entry.symbol());
 
-        List<String> docs = documentation(entry.method(), returnMapping, releaseHandleSymbol, listenerDocs);
+        List<String> docs = documentation(entry.member(), returnMapping, releaseHandleSymbol, listenerDocs);
         if (!docs.isEmpty()) {
             CodeBlock lines = CodeBlock.join(docs.stream().map(line -> CodeBlock.of("$S", line)).toList(), ", ");
             annotation.addMember("documentation", docs.size() == 1 ? "$L" : "{$L}", lines);
@@ -406,10 +400,10 @@ final class CEntryPointGenerator {
         return annotation.build();
     }
 
-    /** The method's Javadoc, one entry per line, followed by how listeners are called and ownership notes for the returned value. */
-    private List<String> documentation(ExecutableElement method, Mapping returnMapping, String releaseHandleSymbol, List<String> listenerDocs) {
+    /** The member's Javadoc, one entry per line, followed by how listeners are called and ownership notes for the returned value. */
+    private List<String> documentation(Wrapped member, Mapping returnMapping, String releaseHandleSymbol, List<String> listenerDocs) {
         List<String> lines = new ArrayList<>();
-        String doc = elements.getDocComment(method);
+        String doc = elements.getDocComment(member.element());
         if (doc != null) {
             for (String line : doc.strip().split("\\R")) {
                 lines.add(line.strip());

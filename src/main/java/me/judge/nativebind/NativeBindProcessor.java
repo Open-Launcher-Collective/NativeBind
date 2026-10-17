@@ -93,22 +93,22 @@ public class NativeBindProcessor extends AbstractProcessor {
 
         List<Candidate> candidates = new ArrayList<>();
         for (Element element : elements) {
-            ExecutableElement method = (ExecutableElement) element;
-            if (!isWrappable(method, "@GenerateNativeWrapper")) {
+            if (!isWrappable(element, "@GenerateNativeWrapper")) {
                 continue;
             }
-            try {
-                generator.checkListeners(method);
-            } catch (IllegalArgumentException e) {
-                error(method, e.getMessage());
-                continue;
-            }
-
-            GenerateNativeWrapper annotation = method.getAnnotation(GenerateNativeWrapper.class);
+            GenerateNativeWrapper annotation = element.getAnnotation(GenerateNativeWrapper.class);
             String prefix = annotation.prefix().isEmpty() ? defaultPrefix : annotation.prefix();
-            String symbol = symbolName(method, annotation, prefix);
-            if (symbol != null) {
-                candidates.add(new Candidate(method, prefix, symbol, exceptionHandler(annotation)));
+            for (Wrapped member : Wrapped.of(element)) {
+                try {
+                    generator.checkListeners(member);
+                } catch (IllegalArgumentException e) {
+                    error(element, e.getMessage());
+                    continue;
+                }
+                String symbol = symbolName(member, annotation, prefix);
+                if (symbol != null) {
+                    candidates.add(new Candidate(member, prefix, symbol, exceptionHandler(annotation)));
+                }
             }
         }
 
@@ -119,22 +119,22 @@ public class NativeBindProcessor extends AbstractProcessor {
 
         Map<TypeElement, List<CEntryPointGenerator.Entry>> byOwner = new LinkedHashMap<>();
         for (Candidate candidate : candidates) {
-            ExecutableElement method = candidate.method();
-            if (!export(candidate.symbol(), method, "; set @GenerateNativeWrapper(name = ...) to disambiguate")) {
+            Wrapped member = candidate.member();
+            if (!export(candidate.symbol(), member, "; set @GenerateNativeWrapper(name = ...) to disambiguate")) {
                 continue;
             }
-            byOwner.computeIfAbsent((TypeElement) method.getEnclosingElement(), k -> new ArrayList<>())
-                    .add(new CEntryPointGenerator.Entry(method, candidate.symbol(), candidate.exceptionHandler()));
+            byOwner.computeIfAbsent(member.owner(), k -> new ArrayList<>())
+                    .add(new CEntryPointGenerator.Entry(member, candidate.symbol(), candidate.exceptionHandler()));
         }
 
         byOwner.forEach((owner, entries) -> write(generator.generate(owner, entries, releaseHandleSymbol), owner));
     }
 
-    private record JNICandidate(ExecutableElement method, String jniClass, JNIEntryPointGenerator.Signature signature,
+    private record JNICandidate(Wrapped member, String jniClass, JNIEntryPointGenerator.Signature signature,
                                 JNIEntryPointGenerator.JvmNative jvmNative) {
     }
 
-    private record DeclaredNative(JNIEntryPointGenerator.JvmNative jvmNative, ExecutableElement method) {
+    private record DeclaredNative(JNIEntryPointGenerator.JvmNative jvmNative, Wrapped member) {
     }
 
     private void processJNI(Set<? extends Element> elements, TypeElement wordBase) {
@@ -150,49 +150,50 @@ public class NativeBindProcessor extends AbstractProcessor {
 
         List<JNICandidate> candidates = new ArrayList<>();
         for (Element element : elements) {
-            ExecutableElement method = (ExecutableElement) element;
-            if (!isWrappable(method, "@GenerateJNIWrapper")) {
+            if (!isWrappable(element, "@GenerateJNIWrapper")) {
                 continue;
             }
 
-            GenerateJNIWrapper annotation = method.getAnnotation(GenerateJNIWrapper.class);
+            GenerateJNIWrapper annotation = element.getAnnotation(GenerateJNIWrapper.class);
             String jniClass = annotation.jniClass().isEmpty() ? defaultClass : annotation.jniClass();
             if (jniClass.isEmpty()) {
-                error(method, "set @GenerateJNIWrapper(jniClass = ...) or -A" + JNI_CLASS_OPTION + " to name the JVM class declaring the native method");
+                error(element, "set @GenerateJNIWrapper(jniClass = ...) or -A" + JNI_CLASS_OPTION + " to name the JVM class declaring the native method");
                 continue;
             }
             if (!JNINames.isValidBinaryName(jniClass)) {
-                error(method, "\"" + jniClass + "\" is not a valid class binary name");
+                error(element, "\"" + jniClass + "\" is not a valid class binary name");
                 continue;
             }
-            String name = annotation.name().isEmpty() ? Wrapped.defaultName(method) : annotation.name();
-            if (!SourceVersion.isIdentifier(name) || SourceVersion.isKeyword(name)) {
-                error(method, "\"" + name + "\" is not a valid Java method name");
-                continue;
-            }
+            for (Wrapped member : Wrapped.of(element)) {
+                String name = annotation.name().isEmpty() ? member.defaultName() : member.name(annotation.name());
+                if (!SourceVersion.isIdentifier(name) || SourceVersion.isKeyword(name)) {
+                    error(element, "\"" + name + "\" is not a valid Java method name");
+                    continue;
+                }
 
-            JNIEntryPointGenerator.Signature signature;
-            try {
-                signature = generator.signature(method);
-            } catch (IllegalArgumentException e) {
-                error(method, e.getMessage());
-                continue;
+                JNIEntryPointGenerator.Signature signature;
+                try {
+                    signature = generator.signature(member);
+                } catch (IllegalArgumentException e) {
+                    error(element, e.getMessage());
+                    continue;
+                }
+                candidates.add(new JNICandidate(member, jniClass, signature, generator.jvmNative(name, member, signature)));
             }
-            candidates.add(new JNICandidate(method, jniClass, signature, generator.jvmNative(name, method, signature)));
         }
         if (candidates.isEmpty()) {
             return;
         }
 
-        // Every native method each JVM class declares, with the annotated method it calls (null for support)
+        // Every native method each JVM class declares, with the wrapped member it calls (null for support)
         Map<String, List<DeclaredNative>> byJvmClass = new LinkedHashMap<>();
         for (JNICandidate candidate : candidates) {
             byJvmClass.computeIfAbsent(candidate.jniClass(), k -> new ArrayList<>())
-                    .add(new DeclaredNative(candidate.jvmNative(), candidate.method()));
+                    .add(new DeclaredNative(candidate.jvmNative(), candidate.member()));
         }
 
         Set<TypeElement> owners = new LinkedHashSet<>();
-        candidates.forEach(c -> owners.add((TypeElement) c.method().getEnclosingElement()));
+        candidates.forEach(c -> owners.add(c.member().owner()));
 
         String supportJvmClass = null;
         String supportPackage = null;
@@ -226,7 +227,7 @@ public class NativeBindProcessor extends AbstractProcessor {
             }
         }
 
-        Map<ExecutableElement, String> symbols = new HashMap<>();
+        Map<Wrapped, String> symbols = new HashMap<>();
         Map<String, String> supportSymbols = new HashMap<>();
         // Support natives a hand-written class may leave out
         Set<String> optionalNames = new HashSet<>();
@@ -235,7 +236,7 @@ public class NativeBindProcessor extends AbstractProcessor {
         String supportClass = supportJvmClass;
         byJvmClass.forEach((jvmClass, natives) -> {
             TypeElement existing = generateJvmClasses ? null : processingEnv.getElementUtils().getTypeElement(jvmClass.replace('$', '.'));
-            Element anyOrigin = natives.stream().map(DeclaredNative::method).filter(m -> m != null).findFirst().orElse(null);
+            Element anyOrigin = natives.stream().map(DeclaredNative::member).filter(m -> m != null).map(Wrapped::element).findFirst().orElse(null);
             if (generateJvmClasses && !generatedJvmClasses.add(jvmClass)) {
                 error(anyOrigin, jvmClass + " was already generated in an earlier round; its native methods must all be known in one round");
                 return;
@@ -260,16 +261,16 @@ public class NativeBindProcessor extends AbstractProcessor {
             List<JNIEntryPointGenerator.JvmNative> accepted = new ArrayList<>();
             for (DeclaredNative declared : natives) {
                 JNIEntryPointGenerator.JvmNative jvmNative = declared.jvmNative();
-                ExecutableElement method = declared.method();
-                Element origin = method != null ? method : anyOrigin;
+                Wrapped member = declared.member();
+                Element origin = member != null ? member.element() : anyOrigin;
                 if (!seen.add(jvmNative.name() + jvmNative.descriptor())) {
                     error(origin, jvmClass + "." + jvmNative.name() + jvmNative.descriptor() + " is declared more than once; "
                             + "set @GenerateJNIWrapper(name = ...) to disambiguate");
                     continue;
                 }
-                if (method != null && generateJvmClasses && jvmClass.equals(supportClass)
+                if (member != null && generateJvmClasses && jvmClass.equals(supportClass)
                         && JNIEntryPointGenerator.JVM_HELPERS.contains(jvmNative.name())) {
-                    error(method, jvmClass + "." + jvmNative.name() + " is reserved for isolate thread management; "
+                    error(origin, jvmClass + "." + jvmNative.name() + " is reserved for isolate thread management; "
                             + "set @GenerateJNIWrapper(name = ...) to rename it");
                     continue;
                 }
@@ -277,14 +278,14 @@ public class NativeBindProcessor extends AbstractProcessor {
                 String symbol = descriptorsByName.get(jvmNative.name()).size() > 1
                         ? JNINames.longName(jvmClass, jvmNative.name(), jvmNative.argumentDescriptor())
                         : JNINames.shortName(jvmClass, jvmNative.name());
-                if (method == null) {
+                if (member == null) {
                     supportSymbols.put(jvmNative.name(), symbol);
                     exportedSymbols.put(symbol, JNIEntryPointGenerator.SUPPORT_CLASS);
-                } else if (export(symbol, method, "; set @GenerateJNIWrapper(name = ...) to disambiguate")) {
-                    symbols.put(method, symbol);
+                } else if (export(symbol, member, "; set @GenerateJNIWrapper(name = ...) to disambiguate")) {
+                    symbols.put(member, symbol);
                 }
                 // A hand-written class only needs the builtins it wants to call
-                boolean optional = method == null && optionalNames.contains(jvmNative.name())
+                boolean optional = member == null && optionalNames.contains(jvmNative.name())
                         && !existingDescriptors.containsKey(jvmNative.name());
                 if (existing != null && !optional) {
                     String problem = generator.verify(existing, jvmNative);
@@ -313,26 +314,26 @@ public class NativeBindProcessor extends AbstractProcessor {
 
         Map<TypeElement, List<JNIEntryPointGenerator.Entry>> byOwner = new LinkedHashMap<>();
         for (JNICandidate candidate : candidates) {
-            String symbol = symbols.get(candidate.method());
+            String symbol = symbols.get(candidate.member());
             if (symbol != null) {
-                byOwner.computeIfAbsent((TypeElement) candidate.method().getEnclosingElement(), k -> new ArrayList<>())
-                        .add(new JNIEntryPointGenerator.Entry(candidate.method(), symbol, candidate.signature()));
+                byOwner.computeIfAbsent(candidate.member().owner(), k -> new ArrayList<>())
+                        .add(new JNIEntryPointGenerator.Entry(candidate.member(), symbol, candidate.signature()));
             }
         }
         byOwner.forEach((owner, entries) -> write(generator.generate(owner, entries), owner));
     }
 
-    /** Claims a symbol for {@code method}, reporting an error if something else already exports it. */
-    private boolean export(String symbol, ExecutableElement method, String hint) {
-        String previous = exportedSymbols.putIfAbsent(symbol, method.getEnclosingElement() + "." + method);
+    /** Claims a symbol for {@code member}, reporting an error if something else already exports it. */
+    private boolean export(String symbol, Wrapped member, String hint) {
+        String previous = exportedSymbols.putIfAbsent(symbol, member.description());
         if (previous != null) {
-            error(method, "symbol \"" + symbol + "\" is already exported by " + previous + hint);
+            error(member.element(), "symbol \"" + symbol + "\" is already exported by " + previous + hint);
             return false;
         }
         return true;
     }
 
-    private record Candidate(ExecutableElement method, String prefix, String symbol, TypeMirror exceptionHandler) {
+    private record Candidate(Wrapped member, String prefix, String symbol, TypeMirror exceptionHandler) {
     }
 
     /**
@@ -357,7 +358,7 @@ public class NativeBindProcessor extends AbstractProcessor {
         }
 
         Set<TypeElement> owners = new LinkedHashSet<>();
-        candidates.forEach(c -> owners.add((TypeElement) c.method().getEnclosingElement()));
+        candidates.forEach(c -> owners.add(c.member().owner()));
 
         String packageName = supportPackage(owners);
         if (packageName == null) {
@@ -451,40 +452,41 @@ public class NativeBindProcessor extends AbstractProcessor {
         }
     }
 
-    /** The generated class sits in the owner's package and must be able to call the method from there. */
-    private boolean isWrappable(ExecutableElement method, String annotation) {
+    /** The generated class sits in the owner's package and must be able to reach the member from there. */
+    private boolean isWrappable(Element member, String annotation) {
         boolean ok = true;
-        if (method.getModifiers().contains(Modifier.PRIVATE)) {
-            error(method, annotation + " methods must not be private");
+        if (member.getModifiers().contains(Modifier.PRIVATE)) {
+            error(member, annotation + " members must not be private");
             ok = false;
         }
-        if (!method.getTypeParameters().isEmpty()) {
-            error(method, annotation + " does not support generic methods");
+        if (member instanceof ExecutableElement method && !method.getTypeParameters().isEmpty()) {
+            error(member, annotation + " does not support generic methods");
             ok = false;
         }
-        for (Element e = method.getEnclosingElement(); e instanceof TypeElement type; e = type.getEnclosingElement()) {
+        for (Element e = member.getEnclosingElement(); e instanceof TypeElement type; e = type.getEnclosingElement()) {
             if (type.getNestingKind() != NestingKind.TOP_LEVEL && type.getNestingKind() != NestingKind.MEMBER) {
-                error(method, annotation + " methods must be declared in a top-level or member class");
+                error(member, annotation + " members must be declared in a top-level or member class");
                 return false;
             }
             if (type.getModifiers().contains(Modifier.PRIVATE)) {
-                error(method, annotation + " methods must not be enclosed in a private class (" + type + ")");
+                error(member, annotation + " members must not be enclosed in a private class (" + type + ")");
                 ok = false;
             }
         }
-        if (method.getKind() != ElementKind.METHOD && method.getKind() != ElementKind.CONSTRUCTOR) {
-            error(method, annotation + " only applies to methods and constructors");
+        ElementKind kind = member.getKind();
+        if (kind != ElementKind.METHOD && kind != ElementKind.CONSTRUCTOR && kind != ElementKind.FIELD && kind != ElementKind.ENUM_CONSTANT) {
+            error(member, annotation + " only applies to methods, constructors and fields");
             ok = false;
         }
-        if (Wrapped.isConstructor(method)) {
+        if (kind == ElementKind.CONSTRUCTOR) {
             // The generated factory calls "new Owner(...)", which needs a concrete class and no enclosing instance
-            TypeElement owner = (TypeElement) method.getEnclosingElement();
+            TypeElement owner = (TypeElement) member.getEnclosingElement();
             if (owner.getKind() == ElementKind.ENUM || owner.getModifiers().contains(Modifier.ABSTRACT)) {
-                error(method, annotation + " constructors must belong to a class that can be instantiated");
+                error(member, annotation + " constructors must belong to a class that can be instantiated");
                 ok = false;
             }
             if (owner.getNestingKind() == NestingKind.MEMBER && !owner.getModifiers().contains(Modifier.STATIC)) {
-                error(method, annotation + " constructors must not belong to an inner (non-static) class");
+                error(member, annotation + " constructors must not belong to an inner (non-static) class");
                 ok = false;
             }
         }
@@ -492,30 +494,31 @@ public class NativeBindProcessor extends AbstractProcessor {
     }
 
     /** Builds the exported name, or reports an error and returns null when it cannot be a valid C identifier. */
-    private String symbolName(ExecutableElement method, GenerateNativeWrapper annotation, String prefix) {
+    private String symbolName(Wrapped member, GenerateNativeWrapper annotation, String prefix) {
+        Element element = member.element();
         if (!CNames.isValidPrefix(prefix)) {
-            error(method, "prefix \"" + prefix + "\" is not a valid C identifier prefix; use only [A-Za-z0-9_] and do not start with a digit");
+            error(element, "prefix \"" + prefix + "\" is not a valid C identifier prefix; use only [A-Za-z0-9_] and do not start with a digit");
             return null;
         }
 
         String base;
         if (annotation.name().isEmpty()) {
-            base = CNames.sanitize(Wrapped.defaultName(method));
+            base = CNames.sanitize(member.defaultName());
         } else if (annotation.name().chars().allMatch(c -> c == '_' || (c < 128 && Character.isLetterOrDigit(c)))) {
-            base = annotation.name();
+            base = member.name(annotation.name());
         } else {
-            error(method, "name \"" + annotation.name() + "\" may only contain [A-Za-z0-9_]");
+            error(element, "name \"" + annotation.name() + "\" may only contain [A-Za-z0-9_]");
             return null;
         }
 
         String symbol = CNames.join(prefix, base);
         if (!CNames.isValidIdentifier(symbol)) {
-            error(method, "\"" + symbol + "\" is not a valid C identifier; set a prefix or name");
+            error(element, "\"" + symbol + "\" is not a valid C identifier; set a prefix or name");
             return null;
         }
         if (CNames.isReserved(symbol)) {
             processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "\"" + symbol + "\" is reserved for the C implementation (leading __ or _ followed by an uppercase letter)", method);
+                    "\"" + symbol + "\" is reserved for the C implementation (leading __ or _ followed by an uppercase letter)", element);
         }
         return symbol;
     }

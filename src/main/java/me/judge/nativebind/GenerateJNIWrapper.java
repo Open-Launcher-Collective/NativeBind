@@ -42,6 +42,10 @@ import java.lang.annotation.Target;
  *     is held through a global reference until the native code no longer holds the listener.</li>
  *     <li>for instance methods, the receiver is passed as a leading {@code long} handle</li>
  * </ul>
+ * A constructor becomes a native method returning a handle to the new object, named {@code new<Class>} by default.
+ * A field becomes a getter {@code get<Field>} and, unless it is final, a setter {@code set<Field>} taking the new
+ * value; {@link #name()} replaces the field name in both.
+ * <p>
  * Each call runs inside a {@code JNIMethodScope}. Any exception is rethrown in the JVM as a
  * {@code java.lang.RuntimeException} whose message is {@code "<exception class>: <message>"}; an exception already
  * pending in the JVM (e.g. from an upcall) propagates unchanged.
@@ -66,7 +70,7 @@ import java.lang.annotation.Target;
  * {@code collectionSize}, {@code listGet}, {@code mapKeys}, {@code mapGet} and {@code optionalGet}. A hand-written
  * JVM class only needs to declare the ones it uses.
  */
-@Target({ElementType.METHOD, ElementType.CONSTRUCTOR})
+@Target({ElementType.METHOD, ElementType.CONSTRUCTOR, ElementType.FIELD})
 @Retention(RetentionPolicy.SOURCE)
 public @interface GenerateJNIWrapper {
     /**
@@ -76,6 +80,9 @@ public @interface GenerateJNIWrapper {
      */
     String jniClass() default "";
 
-    /** Name of the JVM-side native method. Defaults to the annotated method's name. */
+    /**
+     * Name of the JVM-side native method. Defaults to the annotated method's name. On a field, it replaces the field
+     * name after {@code get} / {@code set}.
+     */
     String name() default "";
 }

@@ -190,6 +190,92 @@ import java.util.Map;
     }
 
     @Test
+    public void wrapsFieldsAsGettersAndSetters() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), "demo.Account", """
+                package demo;
+
+                import java.util.List;
+                import me.judge.nativebind.GenerateJNIWrapper;
+                import me.judge.nativebind.GenerateNativeWrapper;
+
+                public class Account {
+                    /** The account's display name. */
+                    @GenerateNativeWrapper(prefix = "lib")
+                    @GenerateJNIWrapper
+                    public String username;
+
+                    @GenerateNativeWrapper(prefix = "lib", name = "count")
+                    @GenerateJNIWrapper(name = "count")
+                    static int instances;
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    @GenerateJNIWrapper
+                    public final List<String> roles = List.of();
+                }
+                """);
+        assertTrue(result.success(), result.errors());
+
+        String c = result.source("demo/AccountCEntryPoints.java");
+        assertTrue(c.contains("@CEntryPoint(name = \"libGetUsername\", documentation = {\"The account's display name.\", \"The returned string is allocated with malloc"), c);
+        assertTrue(c.contains("public static CCharPointer libGetUsername(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle self)"), c);
+        assertTrue(c.contains("return nativeBind$toCString(((Account) nativeBind$fromHandle(self)).username);"), c);
+        assertTrue(c.contains("public static void libSetUsername(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle self, CCharPointer username)"), c);
+        assertTrue(c.contains("((Account) nativeBind$fromHandle(self)).username = nativeBind$toJavaString(username);"), c);
+        assertTrue(c.contains("public static int libGetCount(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread)"), c);
+        assertTrue(c.contains("return Account.instances;"), c);
+        assertTrue(c.contains("public static void libSetCount(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, int instances)"), c);
+        assertTrue(c.contains("Account.instances = instances;"), c);
+        assertTrue(c.contains("public static ObjectHandle libGetRoles(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, ObjectHandle self)"), c);
+        // Final fields only get a getter
+        assertFalse(c.contains("SetRoles"), c);
+
+        String jvm = result.source("demo/jvm/Entrypoints.java");
+        assertTrue(jvm.contains("The account's display name."), jvm);
+        assertTrue(jvm.contains("Reads {@code Account.username} in the native image."), jvm);
+        assertTrue(jvm.contains("Assigns {@code Account.username} in the native image."), jvm);
+        assertTrue(jvm.contains("public static native String getUsername(long self, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native void setUsername(long self, String username, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native int getCount(long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native void setCount(int instances, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native long getRoles(long self, long isolateThread);"), jvm);
+        assertFalse(jvm.contains("setRoles"), jvm);
+
+        String jni = result.source("demo/AccountJNIEntryPoints.java");
+        assertTrue(jni.contains("name = \"Java_demo_jvm_Entrypoints_getUsername\""), jni);
+        assertTrue(jni.contains("try (JNIMethodScope nativeBind$scope = new JNIMethodScope(\"demo.Account.getUsername\", env))"), jni);
+        assertTrue(jni.contains("return JNIUtil.createHSString(env, ((Account) nativeBind$fromHandle(self)).username);"), jni);
+        assertTrue(jni.contains("((Account) nativeBind$fromHandle(self)).username = JNIUtil.createString(env, username);"), jni);
+        assertTrue(jni.contains("return Account.instances;"), jni);
+        assertTrue(jni.contains("Account.instances = instances;"), jni);
+        assertTrue(jni.contains("return nativeBind$toHandle(((Account) nativeBind$fromHandle(self)).roles);"), jni);
+    }
+
+    @Test
+    public void rejectsFieldsThatCannotBeReached() throws IOException {
+        Result result = compile(List.of(), "demo.Api", """
+                package demo;
+
+                import me.judge.nativebind.GenerateNativeWrapper;
+
+                public class Api {
+                    @GenerateNativeWrapper(prefix = "lib")
+                    private int hidden;
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    int value;
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    public int getValue() { return value; }
+                }
+                """);
+        assertFalse(result.success());
+        String errors = result.errors();
+        assertTrue(errors.contains("@GenerateNativeWrapper members must not be private"), errors);
+        assertTrue(errors.contains("symbol \"libGetValue\" is already exported by demo.Api.value (getter)"), errors);
+        assertEquals(2, errors.lines().count(), errors);
+    }
+
+    @Test
     public void rejectsConstructorsThatCannotBeCalled() throws IOException {
         Result result = compile(List.of(), "demo.Outer", """
                 package demo;

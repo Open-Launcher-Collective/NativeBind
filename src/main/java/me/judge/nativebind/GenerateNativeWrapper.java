@@ -28,6 +28,10 @@ import java.lang.annotation.Target;
  *     listener, which may be never.</li>
  *     <li>for instance methods, the receiver is passed as a leading {@code ObjectHandle} parameter</li>
  * </ul>
+ * A constructor is exported as a factory returning a handle to the new object, named {@code new<Class>} by default.
+ * A field is exported as a getter {@code get<Field>} and, unless it is final, a setter {@code set<Field>} taking the
+ * new value; {@link #name()} replaces the field name in both. Instance members take a receiver handle as usual.
+ * <p>
  * If the enclosing class is annotated with {@code @CHeader}, it is copied onto the generated class.
  * <p>
  * Exactly one {@code NativeBindCEntryPoints} class is generated per compilation, however many classes use this
@@ -48,7 +52,7 @@ import java.lang.annotation.Target;
  *     <li>containers: {@code collectionSize}, {@code listGet}, {@code mapKeys}, {@code mapGet}, {@code optionalGet}</li>
  * </ul>
  */
-@Target({ElementType.METHOD, ElementType.CONSTRUCTOR})
+@Target({ElementType.METHOD, ElementType.CONSTRUCTOR, ElementType.FIELD})
 @Retention(RetentionPolicy.SOURCE)
 public @interface GenerateNativeWrapper {
     /**
@@ -58,8 +62,8 @@ public @interface GenerateNativeWrapper {
     String prefix() default "";
 
     /**
-     * Replaces the method name as the base of the exported symbol (the prefix is still applied).
-     * Required to disambiguate overloaded methods.
+     * Replaces the method name as the base of the exported symbol (the prefix is still applied). On a field, it
+     * replaces the field name after {@code get} / {@code set}. Required to disambiguate overloaded methods.
      */
     String name() default "";
 

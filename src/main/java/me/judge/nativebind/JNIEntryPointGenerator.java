@@ -130,7 +130,7 @@ final class JNIEntryPointGenerator {
         }
     }
 
-    record Entry(ExecutableElement method, String symbol, Signature signature) {
+    record Entry(Wrapped member, String symbol, Signature signature) {
     }
 
     /** {@code builtins} maps each {@link Builtins.Builtin} name to its exported symbol. */
@@ -234,13 +234,13 @@ final class JNIEntryPointGenerator {
         return new Mapping(Kind.LISTENER, type, JOBJECT, jvmType, descriptor(jvmType));
     }
 
-    Signature signature(ExecutableElement method) {
+    Signature signature(Wrapped member) {
         List<Mapping> params = new ArrayList<>();
-        for (VariableElement p : method.getParameters()) {
+        for (VariableElement p : member.parameters()) {
             Listener listener = listenerOf(p.asType());
             params.add(listener == null ? map(p.asType()) : listenerMapping(p.asType(), listener));
         }
-        Mapping returns = map(Wrapped.returnType(method));
+        Mapping returns = map(member.returnType(types));
         if (returns.kind() == Kind.ENV) {
             throw new IllegalArgumentException("JNIEnv cannot be returned to the JVM");
         }
@@ -248,14 +248,14 @@ final class JNIEntryPointGenerator {
     }
 
     /** The JVM-side declaration: {@code [long self,] <non-JNIEnv params>..., long isolateThread}. */
-    JvmNative jvmNative(String name, ExecutableElement method, Signature signature) {
+    JvmNative jvmNative(String name, Wrapped member, Signature signature) {
         Set<String> taken = new HashSet<>();
-        method.getParameters().forEach(p -> taken.add(p.getSimpleName().toString()));
+        member.parameters().forEach(p -> taken.add(p.getSimpleName().toString()));
 
         List<TypeName> paramTypes = new ArrayList<>();
         List<String> paramNames = new ArrayList<>();
         StringBuilder descriptor = new StringBuilder();
-        if (Wrapped.hasReceiver(method)) {
+        if (member.hasReceiver()) {
             paramTypes.add(TypeName.LONG);
             paramNames.add(unique("self", taken));
             descriptor.append('J');
@@ -264,7 +264,7 @@ final class JNIEntryPointGenerator {
             Mapping mapping = signature.params().get(i);
             if (mapping.kind() != Kind.ENV) {
                 paramTypes.add(mapping.jvmType());
-                paramNames.add(method.getParameters().get(i).getSimpleName().toString());
+                paramNames.add(member.parameters().get(i).getSimpleName().toString());
                 descriptor.append(mapping.descriptor());
             }
         }
@@ -273,15 +273,19 @@ final class JNIEntryPointGenerator {
         descriptor.append('J');
 
         StringBuilder javadoc = new StringBuilder();
-        String doc = elements.getDocComment(method);
+        String doc = elements.getDocComment(member.element());
         if (doc != null) {
             javadoc.append(doc.strip()).append("\n\n");
         }
-        javadoc.append("Calls {@code ").append(Wrapped.displayName(method)).append("} in the native image.\n");
+        javadoc.append(switch (member.kind()) {
+            case GETTER -> "Reads {@code " + member.displayName() + "}";
+            case SETTER -> "Assigns {@code " + member.displayName() + "}";
+            default -> "Calls {@code " + member.displayName() + "}";
+        }).append(" in the native image.\n");
         for (int i = 0; i < signature.params().size(); i++) {
             Mapping mapping = signature.params().get(i);
             if (mapping.kind() == Kind.LISTENER) {
-                javadoc.append("{@code ").append(method.getParameters().get(i).getSimpleName())
+                javadoc.append("{@code ").append(member.parameters().get(i).getSimpleName())
                         .append("} is called on whichever thread the native code notifies it from, attached to the JVM for "
                                 + "the call if necessary. Anything it throws is printed as a warning and otherwise ignored.");
                 if (listenerOf(mapping.type()).kind() == Listener.Kind.HANDLE) {
@@ -398,13 +402,13 @@ final class JNIEntryPointGenerator {
     }
 
     private MethodSpec wrapper(TypeElement owner, Entry entry, Set<Kind> usedParams, Set<Kind> usedReturns, Map<String, Listener> listeners) {
-        ExecutableElement method = entry.method();
+        Wrapped member = entry.member();
         Signature signature = entry.signature();
         Set<String> taken = new HashSet<>();
-        method.getParameters().forEach(p -> taken.add(p.getSimpleName().toString()));
+        member.parameters().forEach(p -> taken.add(p.getSimpleName().toString()));
         String env = unique("env", taken);
         String clazz = unique("clazz", taken);
-        String self = Wrapped.hasReceiver(method) ? unique("self", taken) : null;
+        String self = member.hasReceiver() ? unique("self", taken) : null;
         String thread = unique("isolateThread", taken);
 
         Mapping returns = signature.returns();
@@ -424,7 +428,7 @@ final class JNIEntryPointGenerator {
         List<CodeBlock> args = new ArrayList<>();
         for (int i = 0; i < signature.params().size(); i++) {
             Mapping mapping = signature.params().get(i);
-            String name = method.getParameters().get(i).getSimpleName().toString();
+            String name = member.parameters().get(i).getSimpleName().toString();
             usedParams.add(mapping.kind());
             if (mapping.kind() == Kind.ENV) {
                 args.add(CodeBlock.of("$N", env));
@@ -448,18 +452,12 @@ final class JNIEntryPointGenerator {
         }
         builder.addParameter(ParameterSpec.builder(ISOLATE_THREAD, thread).addAnnotation(ISOLATE_THREAD_CONTEXT).build());
 
-        CodeBlock call;
-        if (Wrapped.isConstructor(method)) {
-            call = CodeBlock.of("new $T($L)", ClassName.get(owner), CodeBlock.join(args, ", "));
-        } else {
-            CodeBlock target = self == null
-                    ? CodeBlock.of("$T", ClassName.get(owner))
-                    : CodeBlock.of("(($T) $N($N))", TypeName.get(types.erasure(owner.asType())), FROM_HANDLE, self);
-            call = CodeBlock.of("$L.$N($L)", target, method.getSimpleName().toString(), CodeBlock.join(args, ", "));
-        }
+        CodeBlock receiver = self == null
+                ? null
+                : CodeBlock.of("(($T) $N($N))", TypeName.get(types.erasure(owner.asType())), FROM_HANDLE, self);
+        CodeBlock call = member.call(receiver, args);
 
-        String scopeName = owner.getQualifiedName() + "." + method.getSimpleName();
-        builder.beginControlFlow("try ($T $N = new $T($S, $N))", JNI_METHOD_SCOPE, SCOPE, JNI_METHOD_SCOPE, scopeName, env);
+        builder.beginControlFlow("try ($T $N = new $T($S, $N))", JNI_METHOD_SCOPE, SCOPE, JNI_METHOD_SCOPE, member.scopeName(), env);
         switch (returns.kind()) {
             case VOID -> builder.addStatement("$L", call);
             case STRING -> builder.addStatement("return $T.createHSString($N, $L)", JNI_UTIL, env, call);
