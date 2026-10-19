@@ -13,6 +13,10 @@ import javax.tools.StandardLocation;
 import javax.tools.ToolProvider;
 import java.io.IOException;
 import java.net.URI;
+import java.lang.reflect.Method;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.util.Collection;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -307,6 +311,254 @@ import java.util.Map;
     }
 
     @Test
+    public void passesEnumsAsCEnums() throws IOException {
+        Result result = compile(List.of(), Map.of(
+                "demo.Status", """
+                        package demo;
+
+                        enum Status { OK, inProgress, FAILED }
+                        """,
+                "demo.Api", """
+                        package demo;
+
+                        import me.judge.nativebind.GenerateNativeWrapper;
+                        import org.graalvm.nativeimage.c.CContext;
+                        import org.graalvm.nativeimage.c.constant.CEnum;
+
+                        public class Api {
+                            public static final class Directives implements CContext.Directives {}
+
+                            @CContext(Directives.class)
+                            @CEnum("level_t")
+                            public enum Level { LOW, HIGH }
+
+                            public enum Mode { FAST, SAFE }
+
+                            @GenerateNativeWrapper(prefix = "lib")
+                            public static Status retry(Status previous, Mode mode) { return previous; }
+
+                            @GenerateNativeWrapper(prefix = "lib")
+                            public static Level level(Level level) { return level; }
+
+                            @GenerateNativeWrapper(prefix = "lib")
+                            public static Status status;
+                        }
+                        """));
+        assertTrue(result.success(), result.errors());
+
+        String c = result.source("demo/ApiCEntryPoints.java");
+        assertTrue(c.contains("public static StatusCEnum libRetry(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, StatusCEnum previous, Api_ModeCEnum mode)"), c);
+        assertTrue(c.contains("return StatusCEnum.fromJava(Api.retry(StatusCEnum.toJava(previous), Api_ModeCEnum.toJava(mode)));"), c);
+        assertTrue(c.contains("\"A previous outside its enumeration reaches the Java code as null.\""), c);
+        assertTrue(c.contains("\"A null result from the Java code cannot be represented and fails the call.\""), c);
+        // Enums that are already @CEnum are left to native-image
+        assertTrue(c.contains("public static Api.Level libLevel(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, Api.Level level)"), c);
+        assertTrue(c.contains("return Api.level(level);"), c);
+        assertTrue(c.contains("Api.status = StatusCEnum.toJava(status);"), c);
+        assertFalse(Files.exists(result.generated().resolve("demo/Api_LevelCEnum.java")));
+
+        String status = result.source("demo/StatusCEnum.java");
+        assertTrue(status.contains("@CContext(StatusCEnum.Directives.class) @CEnum(\"libStatus\") public enum StatusCEnum"), status);
+        assertTrue(status.contains("@CEnumConstant(\"LIB_STATUS_OK\") OK, @CEnumConstant(\"LIB_STATUS_IN_PROGRESS\") inProgress, @CEnumConstant(\"LIB_STATUS_FAILED\") FAILED;"), status);
+        assertTrue(status.contains("@CEnumValue public native int toC();"), status);
+        assertTrue(status.contains("@CEnumLookup public static native StatusCEnum fromC(int value);"), status);
+        assertTrue(status.contains("public static Status toJava(StatusCEnum value) { return value == null ? null : JAVA[value.ordinal()]; }"), status);
+        assertTrue(status.contains("public static StatusCEnum fromJava(Status value) { return value == null ? null : MIRRORS[value.ordinal()]; }"), status);
+        assertTrue(status.contains("public static final class Directives implements CContext.Directives"), status);
+        assertTrue(result.source("demo/Api_ModeCEnum.java").contains("@CEnum(\"libApi_Mode\")"));
+
+        // The mirrors, and the enums their static initializers read, are initialized at build time by the C feature
+        String feature = result.source("demo/NativeBindCFeature.java");
+        assertTrue(feature.contains("public final class NativeBindCFeature implements Feature { private final List<Class<?>> mirrors = new ArrayList<>(); public NativeBindCFeature() { }"), feature);
+        assertTrue(feature.contains("Enumeration<URL> lists = access.getApplicationClassLoader().getResources(\"META-INF/nativebind/demo/build-time-classes\");"), feature);
+        assertTrue(feature.contains("RuntimeClassInitialization.initializeAtBuildTime(type);"), feature);
+        assertEquals("Args = --features=demo.NativeBindCFeature\n",
+                Files.readString(result.classes().resolve("META-INF/native-image/nativebind/demo/c/native-image.properties")));
+        // Once the image is written, the definitions go beside its headers, which include those they use
+        assertTrue(feature.contains("public void afterImageWrite(Feature.AfterImageWriteAccess access)"), feature);
+        assertTrue(feature.contains("headers.put(mirror.getAnnotation(CEnum.class).value(), (String) mirror.getField(\"HEADER\").get(null));"), feature);
+        assertTrue(feature.contains("Files.writeString(directory.resolve(header.getKey() + \".h\"), header.getValue());"), feature);
+        try (URLClassLoader loader = new URLClassLoader(new URL[]{result.classes().toUri().toURL()}, getClass().getClassLoader())) {
+            Method includeEnums = loader.loadClass("demo.NativeBindCFeature").getDeclaredMethod("includeEnums", String.class, Collection.class);
+            includeEnums.setAccessible(true);
+            String imageHeader = """
+                    #ifndef __DEMO_H
+                    #define __DEMO_H
+
+                    #include <graal_isolate.h>
+
+                    libStatus libRetry(graal_isolatethread_t*, libStatus, libApi_Mode);
+
+                    #endif
+                    """;
+            String included = (String) includeEnums.invoke(null, imageHeader, List.of("libStatus", "libApi_Mode", "libUnused"));
+            assertEquals("""
+                    #ifndef __DEMO_H
+                    #define __DEMO_H
+                    #include "libStatus.h"
+                    #include "libApi_Mode.h"
+
+                    #include <graal_isolate.h>
+
+                    libStatus libRetry(graal_isolatethread_t*, libStatus, libApi_Mode);
+
+                    #endif
+                    """, included);
+            // Running again (or on a header that uses none of them) leaves it as it is
+            assertEquals(included, includeEnums.invoke(null, included, List.of("libStatus", "libApi_Mode")));
+            assertEquals("#include <graal_isolate.h>\n", includeEnums.invoke(null, "#include <graal_isolate.h>\n", List.of("libStatus")));
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+        // @CEnum enums are the user's own, so they are left alone
+        assertEquals("demo.StatusCEnum\ndemo.Status\ndemo.Api_ModeCEnum\ndemo.Api$Mode\n",
+                Files.readString(result.classes().resolve("META-INF/nativebind/demo/build-time-classes")));
+
+        String header = Files.readString(result.classes().resolve("META-INF/nativebind/include/libStatus.h"));
+        assertEquals("""
+                #ifndef NATIVEBIND_LIB_STATUS_H
+                #define NATIVEBIND_LIB_STATUS_H
+
+                /* Mirrors demo.Status */
+                typedef enum libStatus {
+                    LIB_STATUS_OK = 0,
+                    LIB_STATUS_IN_PROGRESS = 1,
+                    LIB_STATUS_FAILED = 2
+                } libStatus;
+
+                #endif
+                """, header);
+    }
+
+    @Test
+    public void passesEnumsToTheJvmAsMocks() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), Map.of(
+                "demo.Status", """
+                        package demo;
+
+                        /** How a request went. */
+                        public enum Status { OK, inProgress, FAILED }
+                        """,
+                "demo.Api", """
+                        package demo;
+
+                        import me.judge.nativebind.GenerateJNIWrapper;
+                        import org.graalvm.nativeimage.c.CContext;
+                        import org.graalvm.nativeimage.c.constant.CEnum;
+
+                        public class Api {
+                            public static final class Directives implements CContext.Directives {}
+
+                            @CContext(Directives.class)
+                            @CEnum
+                            public enum Level { LOW, HIGH }
+
+                            @GenerateJNIWrapper
+                            public static Status retry(Status previous, Level level) { return previous; }
+
+                            @GenerateJNIWrapper
+                            public static Status status;
+                        }
+                        """));
+        assertTrue(result.success(), result.errors());
+
+        String jvm = result.source("demo/jvm/Entrypoints.java");
+        assertTrue(jvm.contains("public static native Status retry(Status previous, Api_Level level, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public static native void setStatus(Status status, long isolateThread);"), jvm);
+        // Mocks hold the constants only, in the same order, so that ordinals match
+        assertTrue(jvm.contains("How a request went. * <p> * Stands in for {@code demo.Status}, which native methods pass as the constant with the same ordinal. */ public enum Status { OK, inProgress, FAILED }"), jvm);
+        assertTrue(jvm.contains("public enum Api_Level { LOW, HIGH }"), jvm);
+        assertFalse(jvm.contains("import demo."), jvm);
+        assertFalse(jvm.contains("org.graalvm"), jvm);
+
+        String jni = result.source("demo/ApiJNIEntryPoints.java");
+        assertTrue(jni.contains("public static JNI.JObject Java_demo_jvm_Entrypoints_retry(JNI.JNIEnv env, JNI.JClass clazz, JNI.JObject previous, JNI.JObject level, @CEntryPoint.IsolateThreadContext IsolateThread isolateThread)"), jni);
+        assertTrue(jni.contains("return nativeBind$enumConstant(env, \"demo/jvm/Entrypoints$Status\", nativeBind$toOrdinal(Api.retry((Status) nativeBind$fromOrdinal(Status.values(), nativeBind$ordinal(env, previous)), (Api.Level) nativeBind$fromOrdinal(Api.Level.values(), nativeBind$ordinal(env, level)))));"), jni);
+        assertTrue(jni.contains("Api.status = (Status) nativeBind$fromOrdinal(Status.values(), nativeBind$ordinal(env, status));"), jni);
+        assertTrue(jni.contains("return env.getFunctions().getCallIntMethodA().call(env, value, ordinal, WordFactory.nullPointer());"), jni);
+        assertTrue(jni.contains("CTypeConversion.toCString(\"()[L\" + type + \";\")"), jni);
+        assertTrue(jni.contains("JNI.JObject constant = JNIUtil.GetObjectArrayElement(env, constants, ordinal);"), jni);
+    }
+
+    @Test
+    public void verifiesHandWrittenEnumMocks() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.generateClass=false"), Map.of(
+                "demo.Natives", """
+                        package demo;
+
+                        public class Natives {
+                            public enum Status { OK, FAILED, inProgress }
+
+                            public static native long createIsolate();
+                            public static native int tearDownIsolate(long isolateThread);
+                            public static native void releaseHandle(long handle, long isolateThread);
+                            public static native Status status(long isolateThread);
+                            public static native void mode(Object mode, long isolateThread);
+                        }
+                        """,
+                "demo.Status", """
+                        package demo;
+
+                        public enum Status { OK, inProgress, FAILED }
+                        """,
+                "demo.Api", """
+                        package demo;
+
+                        public class Api {
+                            public enum Mode { FAST }
+
+                            @me.judge.nativebind.GenerateJNIWrapper(jniClass = "demo.Natives")
+                            public static demo.Status status() { return null; }
+
+                            @me.judge.nativebind.GenerateJNIWrapper(jniClass = "demo.Natives")
+                            public static void mode(Mode mode) {}
+                        }
+                        """));
+        assertFalse(result.success());
+        String errors = result.errors();
+        assertTrue(errors.contains("demo.Natives has no static native method mode(Ldemo/Natives$Api_Mode;J)V"), errors);
+        assertTrue(errors.contains("demo.Natives.Status must declare the constants of demo.Status in the same order: [OK, inProgress, FAILED]"), errors);
+        assertTrue(errors.contains("demo.Natives must declare enum Api_Mode with the constants of demo.Api.Mode in the same order: [FAST]"), errors);
+        assertEquals(3, errors.lines().count(), errors);
+    }
+
+    @Test
+    public void rejectsEnumsThatCannotBePassedToC() throws IOException {
+        Result result = compile(List.of(), "demo.Api", """
+                package demo;
+
+                import me.judge.nativebind.GenerateNativeWrapper;
+
+                public class Api {
+                    private enum Hidden { A }
+
+                    public enum Empty {}
+
+                    public enum Clash { A_B, aB }
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    static void hidden(Hidden value) {}
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    public static Empty empty() { return null; }
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    public static void clash(Clash value) {}
+
+                    @GenerateNativeWrapper(prefix = "lib")
+                    public static void clashAgain(Clash value) {}
+                }
+                """);
+        assertFalse(result.success());
+        String errors = result.errors();
+        assertTrue(errors.contains("enum demo.Api.Hidden cannot be passed to native code: demo.Api.Hidden is private"), errors);
+        assertTrue(errors.contains("enum demo.Api.Empty cannot be passed to C: a C enumeration needs at least one constant"), errors);
+        assertTrue(errors.contains("enum demo.Api.Clash cannot be passed to C: more than one constant would be named LIB_API_CLASH_A_B"), errors);
+        // Each enum is only reported once, and its wrappers are left out rather than failing to compile
+        assertEquals(3, errors.lines().count(), errors);
+    }
+
+    @Test
     public void generatesBuiltinsForCommonTypes() throws IOException {
         Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), "demo.Api", """
                 package demo;
@@ -459,6 +711,88 @@ import java.util.Map;
         // What the listener throws is reported and cleared rather than left pending
         assertTrue(jni.contains("nativeBind$warnIfThrown(current);"), jni);
         assertTrue(jni.contains("JNIUtil.ExceptionDescribe(env); JNIUtil.ExceptionClear(env);"), jni);
+    }
+
+    @Test
+    public void wrapsEnumConsumers() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), Map.of(
+                "demo.Status", """
+                        package demo;
+
+                        public enum Status { OK, FAILED }
+                        """,
+                "demo.Events", """
+                        package demo;
+
+                        import java.util.function.Consumer;
+                        import me.judge.nativebind.GenerateJNIWrapper;
+                        import me.judge.nativebind.GenerateNativeWrapper;
+                        import org.graalvm.nativeimage.c.CContext;
+                        import org.graalvm.nativeimage.c.constant.CEnum;
+
+                        public class Events {
+                            public static final class Directives implements CContext.Directives {}
+
+                            @CContext(Directives.class)
+                            @CEnum
+                            public enum Level { LOW, HIGH }
+
+                            @GenerateNativeWrapper(prefix = "lib")
+                            @GenerateJNIWrapper
+                            public static void onStatus(Consumer<Status> listener) {}
+
+                            @GenerateNativeWrapper(prefix = "lib")
+                            public static void onLevel(Consumer<? super Level> listener) {}
+                        }
+                        """));
+        assertTrue(result.success(), result.errors());
+
+        String c = result.source("demo/EventsCEntryPoints.java");
+        assertTrue(c.contains("public static void libOnStatus(@CEntryPoint.IsolateThreadContext IsolateThread isolateThread, StatusEnumListener listener, VoidPointer listenerData, ListenerFree listenerFree)"), c);
+        assertTrue(c.contains("\"A null value has no C enumeration constant, so notifying it throws a NullPointerException in the Java code.\""), c);
+        // A mirrored enum's callback takes the @CEnum mirror; a @CEnum enum is passed as it is
+        assertTrue(c.contains("public interface StatusEnumListener extends CFunctionPointer { @InvokeCFunctionPointer void invoke(IsolateThread thread, StatusCEnum value, VoidPointer userData);"), c);
+        assertTrue(c.contains("public interface Events_LevelEnumListener extends CFunctionPointer { @InvokeCFunctionPointer void invoke(IsolateThread thread, Events.Level value, VoidPointer userData);"), c);
+        assertTrue(c.contains("private static Consumer<Status> nativeBind$toStatusEnumListener(StatusEnumListener listener, VoidPointer userData, ListenerFree free)"), c);
+        assertTrue(c.contains("if (value == null) { throw new NullPointerException(\"null cannot be passed to a C listener of demo.Status\"); } WordFactory.<StatusEnumListener>pointer(listenerAddress).invoke(CurrentIsolate.getCurrentThread(), StatusCEnum.fromJava(value), WordFactory.pointer(userDataAddress));"), c);
+        assertTrue(c.contains(".invoke(CurrentIsolate.getCurrentThread(), value, WordFactory.pointer(userDataAddress));"), c);
+        // Listener enums are mirrored like parameters
+        assertTrue(Files.exists(result.generated().resolve("demo/StatusCEnum.java")));
+
+        String jvm = result.source("demo/jvm/Entrypoints.java");
+        assertTrue(jvm.contains("public static native void onStatus(Consumer<Status> listener, long isolateThread);"), jvm);
+        assertTrue(jvm.contains("public enum Status { OK, FAILED }"), jvm);
+
+        String jni = result.source("demo/EventsJNIEntryPoints.java");
+        assertTrue(jni.contains("Events.onStatus((Consumer) nativeBind$toStatusEnumListener(env, listener, \"demo/jvm/Entrypoints$Status\"));"), jni);
+        // The mock is found on the calling thread, since a thread attached from native code cannot see application classes
+        assertTrue(jni.contains("private static Consumer<Status> nativeBind$toStatusEnumListener(JNI.JNIEnv env, JNI.JObject listener, String type) { if (listener.isNull()) { return null; } JNI.JClass found = JNIUtil.findClass(env, type);"), jni);
+        assertTrue(jni.contains("long enumType = JNIUtil.NewGlobalRef(env, found, \"NativeBind mock enum\").rawValue();"), jni);
+        assertTrue(jni.contains("args.setJObject(nativeBind$enumConstantOf(current, WordFactory.pointer(enumType), type, nativeBind$toOrdinal(value)));"), jni);
+        assertTrue(jni.contains("nativeBind$releaseWhenUnreachable(consumer, vm, reference); nativeBind$releaseWhenUnreachable(consumer, vm, enumType); return consumer;"), jni);
+    }
+
+    @Test
+    public void rejectsMockClashesFromListeners() throws IOException {
+        Result result = compile(List.of("-Anativebind.jni.class=demo.jvm.Entrypoints"), Map.of(
+                "demo.Status", "package demo; public enum Status { OK }",
+                "demo.other.Status", "package demo.other; public enum Status { ON }",
+                "demo.Events", """
+                        package demo;
+
+                        import java.util.function.Consumer;
+                        import me.judge.nativebind.GenerateJNIWrapper;
+
+                        public class Events {
+                            @GenerateJNIWrapper
+                            public static void onStatus(Consumer<Status> listener) {}
+
+                            @GenerateJNIWrapper
+                            public static void onPower(Consumer<demo.other.Status> listener) {}
+                        }
+                        """));
+        assertFalse(result.success());
+        assertEquals("demo.jvm.Entrypoints cannot mock both demo.Status and demo.other.Status as enum Status; bind one of them to another JVM class", result.errors());
     }
 
     @Test
@@ -739,6 +1073,7 @@ import java.util.Map;
             List<String> names = all.map(p -> result.generated().relativize(p).toString()).filter(p -> p.endsWith(".java")).sorted().toList();
             assertEquals(List.of(
                     "demo/NativeBindCEntryPoints.java",
+                    "demo/NativeBindCFeature.java",
                     "demo/NativeBindJNIBridgeSupport.java",
                     "demo/NativeBindJNIEntryPoints.java",
                     "demo/NativeBindJNIFeature.java",

@@ -54,6 +54,22 @@ final class CNames {
         return sb.toString();
     }
 
+    /** {@code judgeLibStatus} becomes {@code JUDGE_LIB_STATUS}: an underscore before each lowercase-to-uppercase step, then uppercased. */
+    static String upperSnake(String identifier) {
+        StringBuilder sb = new StringBuilder(identifier.length() + 8);
+        for (int i = 0; i < identifier.length(); i++) {
+            char c = identifier.charAt(i);
+            if (i > 0 && Character.isUpperCase(c)) {
+                char previous = identifier.charAt(i - 1);
+                if (Character.isLowerCase(previous) || Character.isDigit(previous)) {
+                    sb.append('_');
+                }
+            }
+            sb.append(Character.toUpperCase(c));
+        }
+        return sb.toString();
+    }
+
     /**
      * Joins a prefix and base name. An empty prefix leaves the base untouched, a prefix ending in {@code _} is
      * concatenated as-is, and otherwise the base is capitalized to continue the prefix in camel case.

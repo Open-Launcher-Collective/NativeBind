@@ -15,6 +15,7 @@ import com.palantir.javapoet.WildcardTypeName;
 
 import javax.annotation.processing.ProcessingEnvironment;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
@@ -33,6 +34,7 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -103,13 +105,21 @@ final class JNIEntryPointGenerator {
     private static final String BOX = "nativeBind$box";
     private static final String WARN_IF_THROWN = "nativeBind$warnIfThrown";
     private static final String RELEASE_WHEN_UNREACHABLE = "nativeBind$releaseWhenUnreachable";
+    private static final String ORDINAL = "nativeBind$ordinal";
+    private static final String FROM_ORDINAL = "nativeBind$fromOrdinal";
+    private static final String TO_ORDINAL = "nativeBind$toOrdinal";
+    private static final String ENUM_CONSTANT = "nativeBind$enumConstant";
+    private static final String ENUM_CONSTANT_OF = "nativeBind$enumConstantOf";
 
     /** Non-native methods generated into the JVM class declaring the support natives; user natives may not reuse their names. */
     static final Set<String> JVM_HELPERS = Set.of("openIsolate", "currentIsolateThread", "detachCurrentThread", "closeIsolate");
 
-    /** How a Java value crosses the JNI boundary. */
+    /**
+     * How a Java value crosses the JNI boundary. An {@code ENUM} crosses as the constant with the same ordinal in its
+     * mock: an enum nested in the JVM-side class, since the JVM (e.g. Android) need not have the original.
+     */
     enum Kind {
-        VOID, PRIMITIVE, STRING, STRING_ARRAY, PRIMITIVE_ARRAY, JNI_REFERENCE, ENV, WORD, HANDLE, LISTENER
+        VOID, PRIMITIVE, STRING, STRING_ARRAY, PRIMITIVE_ARRAY, JNI_REFERENCE, ENV, WORD, HANDLE, LISTENER, ENUM
     }
 
     /**
@@ -173,8 +183,11 @@ final class JNIEntryPointGenerator {
         return elements.getTypeElement(JNI + "." + simpleName).asType();
     }
 
-    /** Maps one parameter or return type, throwing {@link IllegalArgumentException} for unsupported types. */
-    Mapping map(TypeMirror type) {
+    /**
+     * Maps one parameter or return type of a native method declared by JVM class {@code jvmClass} (a binary name),
+     * throwing {@link IllegalArgumentException} for unsupported types.
+     */
+    Mapping map(TypeMirror type, String jvmClass) {
         TypeKind kind = type.getKind();
         if (kind == TypeKind.VOID) {
             return new Mapping(Kind.VOID, type, TypeName.VOID, TypeName.VOID, "V");
@@ -184,6 +197,11 @@ final class JNIEntryPointGenerator {
         }
         if (types.isSameType(type, stringType)) {
             return new Mapping(Kind.STRING, type, JSTRING, ClassName.get(String.class), "Ljava/lang/String;");
+        }
+        TypeElement javaEnum = enumOf(type);
+        if (javaEnum != null) {
+            ClassName mock = mockName(jvmClass, javaEnum);
+            return new Mapping(Kind.ENUM, type, JOBJECT, mock, descriptor(mock));
         }
         if (type instanceof ArrayType array) {
             TypeMirror component = array.getComponentType();
@@ -225,26 +243,112 @@ final class JNIEntryPointGenerator {
 
     /**
      * A {@code Consumer} parameter arrives as the JVM's own functional interface: {@code Consumer<String>},
-     * {@code Consumer<Integer>} and so on, or a {@code LongConsumer} receiving handles.
+     * {@code Consumer<Integer>} and so on, a {@code Consumer} of the enum's mock, or a {@code LongConsumer} receiving
+     * handles.
      */
-    private Mapping listenerMapping(TypeMirror type, Listener listener) {
-        TypeName jvmType = listener.kind() == Listener.Kind.HANDLE
-                ? ClassName.get(LongConsumer.class)
-                : ParameterizedTypeName.get(Listener.CONSUMER, listener.javaType());
+    private Mapping listenerMapping(TypeMirror type, Listener listener, String jvmClass) {
+        TypeName jvmType = switch (listener.kind()) {
+            case HANDLE -> ClassName.get(LongConsumer.class);
+            case ENUM -> ParameterizedTypeName.get(Listener.CONSUMER, mockName(jvmClass, listener.enumType()));
+            default -> ParameterizedTypeName.get(Listener.CONSUMER, listener.javaType());
+        };
         return new Mapping(Kind.LISTENER, type, JOBJECT, jvmType, descriptor(jvmType));
     }
 
-    Signature signature(Wrapped member) {
+    /** The JNI name of the mock an enum listener's {@code Consumer} accepts, e.g. {@code demo/Natives$Status}. */
+    private static String mockType(Mapping listenerMapping) {
+        ClassName mock = (ClassName) ((ParameterizedTypeName) listenerMapping.jvmType()).typeArguments().get(0);
+        return mock.reflectionName().replace('.', '/');
+    }
+
+    /** How {@code member} crosses the boundary when bound to a native method of {@code jvmClass} (a binary name). */
+    Signature signature(Wrapped member, String jvmClass) {
         List<Mapping> params = new ArrayList<>();
         for (VariableElement p : member.parameters()) {
             Listener listener = listenerOf(p.asType());
-            params.add(listener == null ? map(p.asType()) : listenerMapping(p.asType(), listener));
+            params.add(listener == null ? map(p.asType(), jvmClass) : listenerMapping(p.asType(), listener, jvmClass));
         }
-        Mapping returns = map(member.returnType(types));
+        Mapping returns = map(member.returnType(types), jvmClass);
         if (returns.kind() == Kind.ENV) {
             throw new IllegalArgumentException("JNIEnv cannot be returned to the JVM");
         }
         return new Signature(params, returns);
+    }
+
+    private static TypeElement enumOf(TypeMirror type) {
+        return type instanceof DeclaredType declared && declared.asElement().getKind() == ElementKind.ENUM
+                ? (TypeElement) declared.asElement()
+                : null;
+    }
+
+    /** The enums a native method with {@code signature} passes, listeners included, each needing a mock in the JVM class. */
+    Set<TypeElement> mockedEnums(Signature signature) {
+        Set<TypeElement> enums = new LinkedHashSet<>();
+        signature.params().forEach(p -> {
+            if (p.kind() == Kind.ENUM) {
+                enums.add(enumOf(p.type()));
+            } else if (p.kind() == Kind.LISTENER && listenerOf(p.type()).kind() == Listener.Kind.ENUM) {
+                enums.add(listenerOf(p.type()).enumType());
+            }
+        });
+        if (signature.returns().kind() == Kind.ENUM) {
+            enums.add(enumOf(signature.returns().type()));
+        }
+        return enums;
+    }
+
+    /** {@code demo.Outer.Status} is mocked by {@code <jvmClass>.Outer_Status}. */
+    static ClassName mockName(String jvmClass, TypeElement javaEnum) {
+        int dot = jvmClass.lastIndexOf('.');
+        String[] simpleNames = jvmClass.substring(dot + 1).split("\\$");
+        ClassName name = ClassName.get(dot < 0 ? "" : jvmClass.substring(0, dot), simpleNames[0]);
+        for (int i = 1; i < simpleNames.length; i++) {
+            name = name.nestedClass(simpleNames[i]);
+        }
+        return name.nestedClass(CEntryPointGenerator.flatName(javaEnum, ""));
+    }
+
+    private static List<String> constantNames(TypeElement javaEnum) {
+        List<String> names = new ArrayList<>();
+        for (Element enclosed : javaEnum.getEnclosedElements()) {
+            if (enclosed.getKind() == ElementKind.ENUM_CONSTANT) {
+                names.add(enclosed.getSimpleName().toString());
+            }
+        }
+        return names;
+    }
+
+    /** The mock of {@code javaEnum}: its constants in the same order, so that ordinals match, and nothing else. */
+    private TypeSpec mockEnum(TypeElement javaEnum, ClassName mock) {
+        TypeSpec.Builder clazz = TypeSpec.enumBuilder(mock.simpleName())
+                .addModifiers(Modifier.PUBLIC);
+        String doc = elements.getDocComment(javaEnum);
+        if (doc != null) {
+            clazz.addJavadoc(doc.strip().replace("$", "$$") + "\n<p>\n");
+        }
+        clazz.addJavadoc("Stands in for {@code $L}, which native methods pass as the constant with the same ordinal.\n",
+                javaEnum.getQualifiedName());
+        constantNames(javaEnum).forEach(clazz::addEnumConstant);
+        return clazz.build();
+    }
+
+    /**
+     * Returns null when the hand-written {@code existing} class declares the mock of {@code javaEnum} with the same
+     * constants in the same order, else a description of the problem.
+     */
+    String verifyMock(TypeElement existing, TypeElement javaEnum) {
+        String binaryName = elements.getBinaryName(existing).toString();
+        ClassName mock = mockName(binaryName, javaEnum);
+        List<String> expected = constantNames(javaEnum);
+        for (Element member : existing.getEnclosedElements()) {
+            if (member.getKind() == ElementKind.ENUM && member.getSimpleName().contentEquals(mock.simpleName())) {
+                List<String> actual = constantNames((TypeElement) member);
+                return actual.equals(expected) ? null : existing.getQualifiedName() + "." + mock.simpleName()
+                        + " must declare the constants of " + javaEnum.getQualifiedName() + " in the same order: " + expected;
+            }
+        }
+        return existing.getQualifiedName() + " must declare enum " + mock.simpleName() + " with the constants of "
+                + javaEnum.getQualifiedName() + " in the same order: " + expected;
     }
 
     /** The JVM-side declaration: {@code [long self,] <non-JNIEnv params>..., long isolateThread}. */
@@ -382,7 +486,7 @@ final class JNIEntryPointGenerator {
             clazz.addMethod(wrapper(owner, entry, params, returns, listeners));
         }
         if (!listeners.isEmpty()) {
-            addListeners(clazz, generated, listeners.values(), returns);
+            addListeners(clazz, generated, listeners, returns);
         }
         addHelpers(clazz, params, returns);
         clazz.addMethod(throwInJvm());
@@ -437,9 +541,10 @@ final class JNIEntryPointGenerator {
             builder.addParameter(mapping.nativeType(), name);
             if (mapping.kind() == Kind.LISTENER) {
                 Listener listener = listenerOf(mapping.type());
-                String suffix = listener.suffix(types);
-                listeners.putIfAbsent(suffix, listener);
-                args.add(CodeBlock.of("($T) $N($N, $N)", Listener.CONSUMER, listenerFactory(suffix), env, name));
+                String suffix = Listener.register(listeners, listener, types);
+                args.add(listener.kind() == Listener.Kind.ENUM
+                        ? CodeBlock.of("($T) $N($N, $N, $S)", Listener.CONSUMER, listenerFactory(suffix), env, name, mockType(mapping))
+                        : CodeBlock.of("($T) $N($N, $N)", Listener.CONSUMER, listenerFactory(suffix), env, name));
                 continue;
             }
             args.add(switch (mapping.kind()) {
@@ -447,6 +552,10 @@ final class JNIEntryPointGenerator {
                 case STRING_ARRAY -> CodeBlock.of("$N($N, $N)", TO_STRING_ARRAY, env, name);
                 case PRIMITIVE_ARRAY -> CodeBlock.of("$T.createArray($N, $N)", JNI_UTIL, env, name);
                 case HANDLE -> CodeBlock.of("($T) $N($N)", TypeName.get(types.erasure(mapping.type())), FROM_HANDLE, name);
+                case ENUM -> {
+                    TypeName javaEnum = TypeName.get(types.erasure(mapping.type()));
+                    yield CodeBlock.of("($T) $N($T.values(), $N($N, $N))", javaEnum, FROM_ORDINAL, javaEnum, ORDINAL, env, name);
+                }
                 default -> CodeBlock.of("$N", name);
             });
         }
@@ -464,6 +573,8 @@ final class JNIEntryPointGenerator {
             case STRING_ARRAY -> builder.addStatement("return $N($N, $L)", TO_HS_STRING_ARRAY, env, call);
             case PRIMITIVE_ARRAY -> builder.addStatement("return $T.createHSArray($N, $L)", JNI_UTIL, env, call);
             case HANDLE -> builder.addStatement("return $N($L)", TO_HANDLE, call);
+            case ENUM -> builder.addStatement("return $N($N, $S, $N($L))", ENUM_CONSTANT, env,
+                    returns.descriptor().substring(1, returns.descriptor().length() - 1), TO_ORDINAL, call);
             default -> builder.addStatement("return $L", call);
         }
         builder.nextControlFlow("catch ($T $N)", Throwable.class, ERROR)
@@ -573,6 +684,86 @@ final class JNIEntryPointGenerator {
                     .addStatement("return value == null ? $T.zero() : $T.getGlobal().create(value)", WORD_FACTORY, OBJECT_HANDLES)
                     .build());
         }
+        if (params.contains(Kind.ENUM)) {
+            clazz.addMethod(MethodSpec.methodBuilder(ORDINAL)
+                    .addJavadoc("The ordinal of the JVM enum constant {@code value}, or -1 for null.\n")
+                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                    .returns(int.class)
+                    .addParameter(JNI_ENV, "env")
+                    .addParameter(JOBJECT, "value")
+                    .beginControlFlow("if (value.isNull())")
+                    .addStatement("return -1")
+                    .endControlFlow()
+                    .addStatement("$T type = $T.findClass(env, $S)", JCLASS, JNI_UTIL, "java/lang/Enum")
+                    .addStatement("$T ordinal", JMETHOD_ID)
+                    .beginControlFlow("try ($T name = $T.toCString($S); $T signature = $T.toCString($S))",
+                            C_CHAR_POINTER_HOLDER, C_TYPE_CONVERSION, "ordinal", C_CHAR_POINTER_HOLDER, C_TYPE_CONVERSION, "()I")
+                    .addStatement("ordinal = $T.GetMethodID(env, type, name.get(), signature.get())", JNI_UTIL)
+                    .nextControlFlow("finally")
+                    .addStatement("$T.DeleteLocalRef(env, type)", JNI_UTIL)
+                    .endControlFlow()
+                    .addStatement("return env.getFunctions().getCallIntMethodA().call(env, value, ordinal, $T.nullPointer())", WORD_FACTORY)
+                    .build());
+            clazz.addMethod(MethodSpec.methodBuilder(FROM_ORDINAL)
+                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                    .returns(Object.class)
+                    .addParameter(Object[].class, "constants")
+                    .addParameter(int.class, "ordinal")
+                    .addStatement("return ordinal < 0 ? null : constants[ordinal]")
+                    .build());
+        }
+        if (returns.contains(Kind.ENUM)) {
+            clazz.addMethod(MethodSpec.methodBuilder(TO_ORDINAL)
+                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                    .returns(int.class)
+                    .addParameter(ParameterizedTypeName.get(ClassName.get(Enum.class), WildcardTypeName.subtypeOf(Object.class)), "value")
+                    .addStatement("return value == null ? -1 : value.ordinal()")
+                    .build());
+            clazz.addMethod(MethodSpec.methodBuilder(ENUM_CONSTANT)
+                    .addJavadoc("The constant of JVM enum {@code type} (e.g. {@code demo/Natives$$Status}) with the given ordinal, or null for -1.\n")
+                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                    .returns(JOBJECT)
+                    .addParameter(JNI_ENV, "env")
+                    .addParameter(String.class, "type")
+                    .addParameter(int.class, "ordinal")
+                    .beginControlFlow("if (ordinal < 0)")
+                    .addStatement("return $T.nullPointer()", WORD_FACTORY)
+                    .endControlFlow()
+                    .addStatement("$T enumType = $T.findClass(env, type)", JCLASS, JNI_UTIL)
+                    .beginControlFlow("if (enumType.isNull())")
+                    // NoClassDefFoundError is pending in the JVM
+                    .addStatement("return $T.nullPointer()", WORD_FACTORY)
+                    .endControlFlow()
+                    .beginControlFlow("try")
+                    .addStatement("return $N(env, enumType, type, ordinal)", ENUM_CONSTANT_OF)
+                    .nextControlFlow("finally")
+                    .addStatement("$T.DeleteLocalRef(env, enumType)", JNI_UTIL)
+                    .endControlFlow()
+                    .build());
+            clazz.addMethod(MethodSpec.methodBuilder(ENUM_CONSTANT_OF)
+                    .addJavadoc("The constant of {@code enumType}, the JVM enum named {@code type}, with the given ordinal, or null for -1.\n")
+                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
+                    .returns(JOBJECT)
+                    .addParameter(JNI_ENV, "env")
+                    .addParameter(JCLASS, "enumType")
+                    .addParameter(String.class, "type")
+                    .addParameter(int.class, "ordinal")
+                    .beginControlFlow("if (ordinal < 0)")
+                    .addStatement("return $T.nullPointer()", WORD_FACTORY)
+                    .endControlFlow()
+                    .addStatement("$T values", JMETHOD_ID)
+                    .beginControlFlow("try ($T name = $T.toCString($S); $T signature = $T.toCString($S + type + $S))",
+                            C_CHAR_POINTER_HOLDER, C_TYPE_CONVERSION, "values", C_CHAR_POINTER_HOLDER, C_TYPE_CONVERSION, "()[L", ";")
+                    .addStatement("values = $T.GetStaticMethodID(env, enumType, name.get(), signature.get())", JNI_UTIL)
+                    .endControlFlow()
+                    .addStatement("$T constants = ($T) env.getFunctions().getCallStaticObjectMethodA().call(env, enumType, values, $T.nullPointer())",
+                            JOBJECT_ARRAY, JOBJECT_ARRAY, WORD_FACTORY)
+                    // An ordinal past the mock's constants leaves an ArrayIndexOutOfBoundsException pending in the JVM
+                    .addStatement("$T constant = $T.GetObjectArrayElement(env, constants, ordinal)", JOBJECT, JNI_UTIL)
+                    .addStatement("$T.DeleteLocalRef(env, constants)", JNI_UTIL)
+                    .addStatement("return constant")
+                    .build());
+        }
     }
 
     private static String listenerFactory(String suffix) {
@@ -584,7 +775,7 @@ final class JNIEntryPointGenerator {
      * {@code Consumer} that native code can call from any thread. The JVM object is held through a global reference,
      * deleted once the {@code Consumer} is unreachable.
      */
-    private void addListeners(TypeSpec.Builder clazz, ClassName generated, Collection<Listener> listeners, Set<Kind> usedReturns) {
+    private void addListeners(TypeSpec.Builder clazz, ClassName generated, Map<String, Listener> listeners, Set<Kind> usedReturns) {
         clazz.addType(Listener.cleanerHolder());
         clazz.addMethod(listenerMethod());
         clazz.addMethod(warnIfThrown());
@@ -604,8 +795,9 @@ final class JNIEntryPointGenerator {
                 .build());
 
         boolean boxes = false;
-        for (Listener listener : listeners) {
-            String suffix = listener.suffix(types);
+        for (Map.Entry<String, Listener> registered : listeners.entrySet()) {
+            String suffix = registered.getKey();
+            Listener listener = registered.getValue();
             CodeBlock prelude = CodeBlock.of("");
             CodeBlock cleanup = CodeBlock.of("");
             CodeBlock.Builder argument = CodeBlock.builder();
@@ -634,18 +826,38 @@ final class JNIEntryPointGenerator {
                             .endControlFlow()
                             .build();
                 }
+                case ENUM -> {
+                    usedReturns.add(Kind.ENUM);
+                    argument.addStatement("args.setJObject($N(current, $T.pointer(enumType), type, $N(value)))",
+                            ENUM_CONSTANT_OF, WORD_FACTORY, TO_ORDINAL);
+                }
             }
             boolean handles = listener.kind() == Listener.Kind.HANDLE;
+            boolean enums = listener.kind() == Listener.Kind.ENUM;
+            // A thread the native code attached cannot find application classes (it sees the system class loader),
+            // so the mock is found now, on the JVM's calling thread, and held until the listener is released
+            CodeBlock resolveMock = !enums ? CodeBlock.of("") : CodeBlock.builder()
+                    .addStatement("$T found = $T.findClass(env, type)", JCLASS, JNI_UTIL)
+                    .beginControlFlow("if (found.isNull())")
+                    .addStatement("throw new $T($S + type)", IllegalStateException.class, "NativeBind could not find mock enum ")
+                    .endControlFlow()
+                    .addStatement("long enumType = $T.NewGlobalRef(env, found, $S).rawValue()", JNI_UTIL, "NativeBind mock enum")
+                    .addStatement("$T.DeleteLocalRef(env, found)", JNI_UTIL)
+                    .build();
 
             TypeName consumer = ParameterizedTypeName.get(Listener.CONSUMER, listener.javaType());
-            clazz.addMethod(MethodSpec.methodBuilder(listenerFactory(suffix))
+            MethodSpec.Builder factory = MethodSpec.methodBuilder(listenerFactory(suffix))
                     .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
                     .returns(consumer)
                     .addParameter(JNI_ENV, "env")
-                    .addParameter(JOBJECT, "listener")
-                    .beginControlFlow("if (listener.isNull())")
+                    .addParameter(JOBJECT, "listener");
+            if (enums) {
+                factory.addParameter(String.class, "type");
+            }
+            factory.beginControlFlow("if (listener.isNull())")
                     .addStatement("return null")
                     .endControlFlow()
+                    .addCode(resolveMock)
                     // Word values cannot be captured by the lambda's object, so they cross it as raw addresses
                     .addStatement("long vm = $T.GetJavaVM(env).rawValue()", JNI_UTIL)
                     .addStatement("long method = $N(env, $S, $S).rawValue()", LISTENER_METHOD,
@@ -674,9 +886,11 @@ final class JNIEntryPointGenerator {
                     .addCode(exitJvm())
                     .endControlFlow()
                     .addCode("$<};\n")
-                    .addStatement("$N(consumer, vm, reference)", RELEASE_WHEN_UNREACHABLE)
-                    .addStatement("return consumer")
-                    .build());
+                    .addStatement("$N(consumer, vm, reference)", RELEASE_WHEN_UNREACHABLE);
+            if (enums) {
+                factory.addStatement("$N(consumer, vm, enumType)", RELEASE_WHEN_UNREACHABLE);
+            }
+            clazz.addMethod(factory.addStatement("return consumer").build());
         }
         if (boxes) {
             clazz.addMethod(box());
@@ -948,10 +1162,12 @@ final class JNIEntryPointGenerator {
     }
 
     /**
-     * The JVM-side class declaring every native method bound to {@code binaryName}; with {@code support}, it also
-     * gets the {@link #JVM_HELPERS} that manage each Java thread's isolate thread.
+     * The JVM-side class declaring every native method bound to {@code binaryName}, and the mock of each enum in
+     * {@code enums} that they pass; with {@code support}, it also gets the {@link #JVM_HELPERS} that manage each Java
+     * thread's isolate thread.
      */
-    JavaFile generateJvmClass(String binaryName, List<JvmNative> natives, boolean support, Iterable<? extends Element> origins) {
+    JavaFile generateJvmClass(String binaryName, List<JvmNative> natives, boolean support, Collection<TypeElement> enums,
+                              Iterable<? extends Element> origins) {
         int dot = binaryName.lastIndexOf('.');
         String packageName = dot < 0 ? "" : binaryName.substring(0, dot);
         String simpleName = binaryName.substring(dot + 1);
@@ -969,6 +1185,9 @@ final class JNIEntryPointGenerator {
                 method.addParameter(jvmNative.paramTypes().get(i), jvmNative.paramNames().get(i));
             }
             clazz.addMethod(method.build());
+        }
+        for (TypeElement javaEnum : enums) {
+            clazz.addType(mockEnum(javaEnum, mockName(binaryName, javaEnum)));
         }
         if (support) {
             addThreadHelpers(clazz);

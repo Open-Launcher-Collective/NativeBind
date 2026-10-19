@@ -6,7 +6,9 @@ import com.palantir.javapoet.FieldSpec;
 import com.palantir.javapoet.TypeName;
 import com.palantir.javapoet.TypeSpec;
 
+import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.Modifier;
+import javax.lang.model.element.TypeElement;
 
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
@@ -15,6 +17,7 @@ import javax.lang.model.type.WildcardType;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
 import java.lang.ref.Cleaner;
+import java.util.Map;
 import java.util.function.Consumer;
 
 /**
@@ -28,8 +31,9 @@ record Listener(Kind kind, TypeMirror valueType) {
     static final ClassName CONSUMER = ClassName.get(Consumer.class);
     static final String CLEANER_HOLDER = "NativeBindCleaner";
 
+    /** {@code ENUM} values cross as the C enumeration (C) or the mock enum (JNI) their parameters would. */
     enum Kind {
-        STRING, BOXED, HANDLE
+        STRING, BOXED, HANDLE, ENUM
     }
 
     /**
@@ -59,10 +63,23 @@ record Listener(Kind kind, TypeMirror valueType) {
         } catch (IllegalArgumentException notBoxed) {
             // Any other object is lent to the callback as a handle
         }
+        if (types.asElement(value) instanceof TypeElement element && element.getKind() == ElementKind.ENUM) {
+            return new Listener(Kind.ENUM, value);
+        }
         if (types.isAssignable(value, wordBase)) {
             throw new IllegalArgumentException("Consumer<" + value + "> cannot be wrapped: word values cannot be boxed");
         }
         return new Listener(Kind.HANDLE, value);
+    }
+
+    /**
+     * Adds {@code listener} to {@code listeners}, keyed by its {@link #suffix}, and returns that key. Two enums
+     * sharing a suffix would also share a C name and a mock, which the processor rejects.
+     */
+    static String register(Map<String, Listener> listeners, Listener listener, Types types) {
+        String suffix = listener.suffix(types);
+        listeners.putIfAbsent(suffix, listener);
+        return suffix;
     }
 
     /** The primitive a {@link Kind#BOXED} value unboxes to. */
@@ -70,16 +87,24 @@ record Listener(Kind kind, TypeMirror valueType) {
         return types.unboxedType(valueType).getKind();
     }
 
+    /** The enum an {@link Kind#ENUM} listener receives. */
+    TypeElement enumType() {
+        return (TypeElement) ((DeclaredType) valueType).asElement();
+    }
+
     /** What the generated {@code Consumer} accepts. */
     TypeName javaType() {
         return switch (kind) {
             case STRING -> ClassName.get(String.class);
-            case BOXED -> TypeName.get(valueType);
+            case BOXED, ENUM -> TypeName.get(valueType);
             case HANDLE -> ClassName.get(Object.class);
         };
     }
 
-    /** Distinguishes the generated callback types: {@code String}, {@code Int}, {@code Boolean}, ..., {@code Handle}. */
+    /**
+     * Distinguishes the generated callback types: {@code String}, {@code Int}, {@code Boolean}, ..., {@code Handle},
+     * or {@code Outer_StatusEnum} for an enum.
+     */
     String suffix(Types types) {
         return switch (kind) {
             case STRING -> "String";
@@ -88,6 +113,7 @@ record Listener(Kind kind, TypeMirror valueType) {
                 yield name.charAt(0) + name.substring(1).toLowerCase();
             }
             case HANDLE -> "Handle";
+            case ENUM -> CEntryPointGenerator.flatName(enumType(), "Enum");
         };
     }
 

@@ -52,6 +52,13 @@ public class NativeBindProcessor extends AbstractProcessor {
     private boolean jniSupportGenerated;
     private final Set<String> generatedJvmClasses = new HashSet<>();
     private String releaseHandleSymbol = "the handle release entry point";
+    // Enums passed to or from C, by qualified name, and the prefix their C names take: the support prefix
+    private final Set<String> mirroredEnums = new HashSet<>();
+    private final Set<String> unmirrorableEnums = new HashSet<>();
+    private String enumPrefix = "";
+    // The C support package, once generated, and the classes its feature initializes at build time, by binary name
+    private String cSupportPackage;
+    private final Map<String, TypeElement> buildTimeClasses = new LinkedHashMap<>();
 
     @Override
     public SourceVersion getSupportedSourceVersion() {
@@ -60,6 +67,10 @@ public class NativeBindProcessor extends AbstractProcessor {
 
     @Override
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
+        if (roundEnv.processingOver()) {
+            writeBuildTimeClasses();
+            return false;
+        }
         if (annotations.isEmpty()) {
             return false;
         }
@@ -120,7 +131,8 @@ public class NativeBindProcessor extends AbstractProcessor {
         Map<TypeElement, List<CEntryPointGenerator.Entry>> byOwner = new LinkedHashMap<>();
         for (Candidate candidate : candidates) {
             Wrapped member = candidate.member();
-            if (!export(candidate.symbol(), member, "; set @GenerateNativeWrapper(name = ...) to disambiguate")) {
+            if (!export(candidate.symbol(), member, "; set @GenerateNativeWrapper(name = ...) to disambiguate")
+                    || !mirrorEnums(generator, member)) {
                 continue;
             }
             byOwner.computeIfAbsent(member.owner(), k -> new ArrayList<>())
@@ -134,7 +146,11 @@ public class NativeBindProcessor extends AbstractProcessor {
                                 JNIEntryPointGenerator.JvmNative jvmNative) {
     }
 
-    private record DeclaredNative(JNIEntryPointGenerator.JvmNative jvmNative, Wrapped member) {
+    /** {@code enums} are the enums the native method passes, each mocked in its JVM class. */
+    private record DeclaredNative(JNIEntryPointGenerator.JvmNative jvmNative, Wrapped member, Set<TypeElement> enums) {
+        DeclaredNative(JNIEntryPointGenerator.JvmNative support) {
+            this(support, null, Set.of());
+        }
     }
 
     private void processJNI(Set<? extends Element> elements, TypeElement wordBase) {
@@ -173,9 +189,17 @@ public class NativeBindProcessor extends AbstractProcessor {
 
                 JNIEntryPointGenerator.Signature signature;
                 try {
-                    signature = generator.signature(member);
+                    signature = generator.signature(member, jniClass);
                 } catch (IllegalArgumentException e) {
                     error(element, e.getMessage());
+                    continue;
+                }
+                String enumProblem = generator.mockedEnums(signature).stream()
+                        .map(NativeBindProcessor::enumProblem)
+                        .filter(p -> p != null)
+                        .findFirst().orElse(null);
+                if (enumProblem != null) {
+                    error(element, enumProblem);
                     continue;
                 }
                 candidates.add(new JNICandidate(member, jniClass, signature, generator.jvmNative(name, member, signature)));
@@ -189,7 +213,7 @@ public class NativeBindProcessor extends AbstractProcessor {
         Map<String, List<DeclaredNative>> byJvmClass = new LinkedHashMap<>();
         for (JNICandidate candidate : candidates) {
             byJvmClass.computeIfAbsent(candidate.jniClass(), k -> new ArrayList<>())
-                    .add(new DeclaredNative(candidate.jvmNative(), candidate.member()));
+                    .add(new DeclaredNative(candidate.jvmNative(), candidate.member(), generator.mockedEnums(candidate.signature())));
         }
 
         Set<TypeElement> owners = new LinkedHashSet<>();
@@ -217,9 +241,9 @@ public class NativeBindProcessor extends AbstractProcessor {
             supportPackage = supportPackage(owners);
             if (supportJvmClass != null && supportPackage != null) {
                 List<DeclaredNative> natives = new ArrayList<>();
-                JNIEntryPointGenerator.supportNatives().forEach(n -> natives.add(new DeclaredNative(n, null)));
-                JNIEntryPointGenerator.threadNatives().forEach(n -> natives.add(new DeclaredNative(n, null)));
-                JNIEntryPointGenerator.builtinNatives().forEach(n -> natives.add(new DeclaredNative(n, null)));
+                JNIEntryPointGenerator.supportNatives().forEach(n -> natives.add(new DeclaredNative(n)));
+                JNIEntryPointGenerator.threadNatives().forEach(n -> natives.add(new DeclaredNative(n)));
+                JNIEntryPointGenerator.builtinNatives().forEach(n -> natives.add(new DeclaredNative(n)));
                 natives.addAll(byJvmClass.getOrDefault(supportJvmClass, List.of()));
                 byJvmClass.put(supportJvmClass, natives);
             } else {
@@ -259,6 +283,8 @@ public class NativeBindProcessor extends AbstractProcessor {
 
             Set<String> seen = new HashSet<>();
             List<JNIEntryPointGenerator.JvmNative> accepted = new ArrayList<>();
+            // Mock enums by simple name, which two enums nested in differently named packages could share
+            Map<String, TypeElement> mocks = new LinkedHashMap<>();
             for (DeclaredNative declared : natives) {
                 JNIEntryPointGenerator.JvmNative jvmNative = declared.jvmNative();
                 Wrapped member = declared.member();
@@ -274,6 +300,16 @@ public class NativeBindProcessor extends AbstractProcessor {
                             + "set @GenerateJNIWrapper(name = ...) to rename it");
                     continue;
                 }
+                TypeElement clash = declared.enums().stream()
+                        .filter(e -> mocks.containsKey(mockSimpleName(jvmClass, e)) && !mocks.get(mockSimpleName(jvmClass, e)).equals(e))
+                        .findFirst().orElse(null);
+                if (clash != null) {
+                    error(origin, jvmClass + " cannot mock both " + mocks.get(mockSimpleName(jvmClass, clash)).getQualifiedName()
+                            + " and " + clash.getQualifiedName() + " as enum " + mockSimpleName(jvmClass, clash)
+                            + "; bind one of them to another JVM class");
+                    continue;
+                }
+                declared.enums().forEach(e -> mocks.put(mockSimpleName(jvmClass, e), e));
                 accepted.add(jvmNative);
                 String symbol = descriptorsByName.get(jvmNative.name()).size() > 1
                         ? JNINames.longName(jvmClass, jvmNative.name(), jvmNative.argumentDescriptor())
@@ -296,7 +332,14 @@ public class NativeBindProcessor extends AbstractProcessor {
             }
 
             if (existing == null) {
-                write(generator.generateJvmClass(jvmClass, accepted, jvmClass.equals(supportClass), owners), anyOrigin);
+                write(generator.generateJvmClass(jvmClass, accepted, jvmClass.equals(supportClass), mocks.values(), owners), anyOrigin);
+            } else {
+                for (TypeElement javaEnum : mocks.values()) {
+                    String problem = generator.verifyMock(existing, javaEnum);
+                    if (problem != null) {
+                        error(anyOrigin, problem);
+                    }
+                }
             }
         });
 
@@ -333,6 +376,101 @@ public class NativeBindProcessor extends AbstractProcessor {
         return true;
     }
 
+    /**
+     * Generates the {@code @CEnum} mirror of each enum {@code member} passes to or from C, unless an earlier member
+     * already did. Returns false, after reporting why, if any of them cannot be mirrored.
+     */
+    private boolean mirrorEnums(CEntryPointGenerator generator, Wrapped member) {
+        boolean ok = true;
+        for (TypeElement javaEnum : generator.mirroredEnums(member)) {
+            String name = javaEnum.getQualifiedName().toString();
+            if (mirroredEnums.contains(name)) {
+                continue;
+            }
+            if (unmirrorableEnums.contains(name) || !mirrorEnum(generator, javaEnum, member.element())) {
+                unmirrorableEnums.add(name);
+                ok = false;
+                continue;
+            }
+            mirroredEnums.add(name);
+        }
+        return ok;
+    }
+
+    private static String mockSimpleName(String jvmClass, TypeElement javaEnum) {
+        return JNIEntryPointGenerator.mockName(jvmClass, javaEnum).simpleName();
+    }
+
+    /** Why generated code in another class cannot name {@code javaEnum}, or null if it can. */
+    private static String enumProblem(TypeElement javaEnum) {
+        String description = "enum " + javaEnum.getQualifiedName();
+        for (Element e = javaEnum; e instanceof TypeElement type; e = type.getEnclosingElement()) {
+            if (type.getNestingKind() != NestingKind.TOP_LEVEL && type.getNestingKind() != NestingKind.MEMBER) {
+                return description + " cannot be passed to native code: it must be a top-level or member type";
+            }
+            if (type.getModifiers().contains(Modifier.PRIVATE)) {
+                return description + " cannot be passed to native code: " + type + " is private";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Names {@code javaEnum} in C as the library prefix followed by its (flattened) simple name, e.g. {@code libStatus},
+     * and each constant as that name in upper snake case followed by the constant's, e.g. {@code LIB_STATUS_OK}.
+     */
+    private boolean mirrorEnum(CEntryPointGenerator generator, TypeElement javaEnum, Element origin) {
+        String description = "enum " + javaEnum.getQualifiedName();
+        String problem = enumProblem(javaEnum);
+        if (problem != null) {
+            error(origin, problem);
+            return false;
+        }
+
+        String cName = CNames.join(enumPrefix, CNames.sanitize(CEntryPointGenerator.flatName(javaEnum, "")));
+        if (!CNames.isValidIdentifier(cName)) {
+            error(origin, description + " cannot be passed to C: \"" + cName + "\" is not a valid C identifier");
+            return false;
+        }
+        Map<String, String> constants = new LinkedHashMap<>();
+        Set<String> cConstants = new HashSet<>();
+        for (Element enclosed : javaEnum.getEnclosedElements()) {
+            if (enclosed.getKind() != ElementKind.ENUM_CONSTANT) {
+                continue;
+            }
+            String javaConstant = enclosed.getSimpleName().toString();
+            String cConstant = CNames.upperSnake(cName) + "_" + CNames.upperSnake(CNames.sanitize(javaConstant));
+            if (!cConstants.add(cConstant)) {
+                error(origin, description + " cannot be passed to C: more than one constant would be named " + cConstant);
+                return false;
+            }
+            constants.put(javaConstant, cConstant);
+        }
+        if (constants.isEmpty()) {
+            error(origin, description + " cannot be passed to C: a C enumeration needs at least one constant");
+            return false;
+        }
+
+        // Type and constant names share the C namespace with the exported functions
+        List<String> names = new ArrayList<>(List.of(cName));
+        names.addAll(constants.values());
+        for (String name : names) {
+            String previous = exportedSymbols.putIfAbsent(name, description);
+            if (previous != null) {
+                error(origin, description + " cannot be passed to C: \"" + name + "\" is already exported by " + previous);
+                return false;
+            }
+        }
+
+        write(generator.generateEnum(javaEnum, cName, constants), origin);
+        // native-image initializes the mirror at build time, and with it the enum its static initializer reads
+        buildTimeClasses.put(CEntryPointGenerator.mirrorName(javaEnum).reflectionName(), javaEnum);
+        buildTimeClasses.put(processingEnv.getElementUtils().getBinaryName(javaEnum).toString(), javaEnum);
+        writeResource(CEntryPointGenerator.ENUM_HEADER_DIRECTORY + cName + ".h",
+                CEntryPointGenerator.enumHeader(javaEnum, cName, constants), Set.of(javaEnum));
+        return true;
+    }
+
     private record Candidate(Wrapped member, String prefix, String symbol, TypeMirror exceptionHandler) {
     }
 
@@ -356,6 +494,7 @@ public class NativeBindProcessor extends AbstractProcessor {
             }
             prefix = prefixes.iterator().next();
         }
+        enumPrefix = prefix;
 
         Set<TypeElement> owners = new LinkedHashSet<>();
         candidates.forEach(c -> owners.add(c.member().owner()));
@@ -398,6 +537,21 @@ public class NativeBindProcessor extends AbstractProcessor {
 
         releaseHandleSymbol = symbols.releaseHandle();
         write(generator.generateSupport(packageName, header, symbols, owners), null);
+        write(generator.generateFeature(packageName, owners), null);
+        writeResource("META-INF/native-image/nativebind/" + (packageName.isEmpty() ? "default" : packageName)
+                + "/c/native-image.properties", CEntryPointGenerator.featureProperties(packageName), owners);
+        cSupportPackage = packageName;
+    }
+
+    /** Lists every class the C feature initializes at build time, now that no further round can add one. */
+    private void writeBuildTimeClasses() {
+        if (cSupportPackage == null || buildTimeClasses.isEmpty()) {
+            return;
+        }
+        StringBuilder names = new StringBuilder();
+        buildTimeClasses.keySet().forEach(name -> names.append(name).append('\n'));
+        writeResource(CEntryPointGenerator.buildTimeClassesResource(cSupportPackage), names.toString(),
+                new LinkedHashSet<>(buildTimeClasses.values()));
     }
 
     /** {@code -Anativebind.package}, or the common package of every wrapped class; null after reporting an invalid option. */

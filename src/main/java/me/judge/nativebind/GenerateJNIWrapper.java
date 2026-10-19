@@ -34,9 +34,14 @@ import java.lang.annotation.Target;
  *     JNI calls on them</li>
  *     <li>a {@code JNI.JNIEnv} parameter receives the caller's environment and does not appear on the JVM side</li>
  *     <li>other {@code WordBase} types (pointers, {@code ObjectHandle}) / {@code long}</li>
+ *     <li>an enum {@code demo.Outer.Status} (including a {@code @CEnum}) / a mock enum {@code Outer_Status} nested in
+ *     the JVM class, declaring the same constants in the same order and nothing else, so the JVM needs no copy of the
+ *     original. A constant crosses as the one with the same ordinal, and null as null. A hand-written JVM class must
+ *     declare the mock itself; NativeBind checks its constants</li>
  *     <li>any other reference type / a {@code long} {@code ObjectHandle} from {@code ObjectHandles.getGlobal()}</li>
  *     <li>{@code java.util.function.Consumer<String>}, or of a boxed type / the same {@code Consumer}; a {@code Consumer}
- *     of any other type / a {@code LongConsumer} receiving handles that are only valid during the call. The native code
+ *     of an enum / a {@code Consumer} of its mock, found when the listener is passed (a thread attached from native code
+ *     cannot load application classes) and held as long as the listener; a {@code Consumer} of any other type / a {@code LongConsumer} receiving handles that are only valid during the call. The native code
  *     may call it any number of times, from any thread: threads the JVM does not know are attached as daemons for the
  *     call and detached afterwards. Anything the listener throws is printed as a warning and cleared. The JVM object
  *     is held through a global reference until the native code no longer holds the listener.</li>

@@ -1,32 +1,49 @@
 package me.judge.nativebind;
 
 import com.palantir.javapoet.AnnotationSpec;
+import com.palantir.javapoet.ArrayTypeName;
 import com.palantir.javapoet.ClassName;
 import com.palantir.javapoet.CodeBlock;
+import com.palantir.javapoet.FieldSpec;
 import com.palantir.javapoet.JavaFile;
 import com.palantir.javapoet.MethodSpec;
 import com.palantir.javapoet.ParameterSpec;
 import com.palantir.javapoet.ParameterizedTypeName;
 import com.palantir.javapoet.TypeName;
 import com.palantir.javapoet.TypeSpec;
+import com.palantir.javapoet.WildcardTypeName;
 
 import javax.annotation.processing.ProcessingEnvironment;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.PackageElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
+import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 import java.util.EnumSet;
+import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -40,6 +57,9 @@ import java.util.concurrent.CompletionStage;
 final class CEntryPointGenerator {
     static final String CLASS_SUFFIX = "CEntryPoints";
     static final String SUPPORT_CLASS = "NativeBindCEntryPoints";
+    static final String FEATURE_CLASS = "NativeBindCFeature";
+    private static final ClassName FEATURE = ClassName.get("org.graalvm.nativeimage.hosted", "Feature");
+    private static final ClassName RUNTIME_CLASS_INITIALIZATION = ClassName.get("org.graalvm.nativeimage.hosted", "RuntimeClassInitialization");
 
     private static final ClassName C_ENTRY_POINT = ClassName.get("org.graalvm.nativeimage.c.function", "CEntryPoint");
     private static final ClassName C_ENTRY_POINT_BUILTIN = C_ENTRY_POINT.nestedClass("Builtin");
@@ -68,17 +88,22 @@ final class CEntryPointGenerator {
     private static final String LISTENER_FREE = "ListenerFree";
     private static final String FREE_WHEN_UNREACHABLE = "nativeBind$freeWhenUnreachable";
 
-    /** How a Java value crosses the C boundary. */
-    enum Mapping {
-        VOID, PASS_THROUGH, STRING, HANDLE;
+    private static final ClassName C_CONTEXT = ClassName.get("org.graalvm.nativeimage.c", "CContext");
+    private static final ClassName C_CONTEXT_DIRECTIVES = C_CONTEXT.nestedClass("Directives");
+    private static final ClassName C_ENUM = ClassName.get("org.graalvm.nativeimage.c.constant", "CEnum");
+    private static final ClassName C_ENUM_CONSTANT = ClassName.get("org.graalvm.nativeimage.c.constant", "CEnumConstant");
+    private static final ClassName C_ENUM_VALUE = ClassName.get("org.graalvm.nativeimage.c.constant", "CEnumValue");
+    private static final ClassName C_ENUM_LOOKUP = ClassName.get("org.graalvm.nativeimage.c.constant", "CEnumLookup");
+    static final String ENUM_SUFFIX = "CEnum";
+    static final String ENUM_HEADER_DIRECTORY = "META-INF/nativebind/include/";
 
-        TypeName cType(TypeMirror type) {
-            return switch (this) {
-                case VOID, PASS_THROUGH -> TypeName.get(type);
-                case STRING -> C_CHAR_POINTER;
-                case HANDLE -> OBJECT_HANDLE;
-            };
-        }
+    /**
+     * How a Java value crosses the C boundary. {@code PASS_THROUGH} includes enums the user annotated with
+     * {@code @CEnum}, which native-image converts itself; {@code ENUM} is any other enum, which crosses as its
+     * generated {@code @CEnum} mirror.
+     */
+    enum Mapping {
+        VOID, PASS_THROUGH, STRING, HANDLE, ENUM
     }
 
     record Entry(Wrapped member, String symbol, TypeMirror exceptionHandler) {
@@ -125,10 +150,182 @@ final class CEntryPointGenerator {
         if (kind.isPrimitive() || types.isAssignable(type, wordBaseType)) {
             return Mapping.PASS_THROUGH;
         }
+        TypeElement javaEnum = enumOf(type);
+        if (javaEnum != null) {
+            return hasAnnotation(javaEnum, C_ENUM) ? Mapping.PASS_THROUGH : Mapping.ENUM;
+        }
         if (types.isSameType(type, stringType)) {
             return Mapping.STRING;
         }
         return Mapping.HANDLE;
+    }
+
+    private TypeName cType(Mapping mapping, TypeMirror type) {
+        return switch (mapping) {
+            case VOID, PASS_THROUGH -> TypeName.get(type);
+            case STRING -> C_CHAR_POINTER;
+            case HANDLE -> OBJECT_HANDLE;
+            case ENUM -> mirrorName(enumOf(type));
+        };
+    }
+
+    private static TypeElement enumOf(TypeMirror type) {
+        return type instanceof DeclaredType declared && declared.asElement().getKind() == ElementKind.ENUM
+                ? (TypeElement) declared.asElement()
+                : null;
+    }
+
+    private static boolean hasAnnotation(Element element, ClassName annotation) {
+        for (AnnotationMirror mirror : element.getAnnotationMirrors()) {
+            if (((TypeElement) mirror.getAnnotationType().asElement()).getQualifiedName().contentEquals(annotation.canonicalName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The enums {@code member} takes or returns that cross as a generated {@code @CEnum} mirror. */
+    Set<TypeElement> mirroredEnums(Wrapped member) {
+        Set<TypeElement> enums = new LinkedHashSet<>();
+        List<TypeMirror> crossing = new ArrayList<>();
+        crossing.add(member.returnType(types));
+        for (VariableElement p : member.parameters()) {
+            Listener listener = listenerOf(p.asType());
+            if (listener == null) {
+                crossing.add(p.asType());
+            } else if (listener.kind() == Listener.Kind.ENUM) {
+                crossing.add(listener.valueType());
+            }
+        }
+        for (TypeMirror type : crossing) {
+            if (mappingOf(type) == Mapping.ENUM) {
+                enums.add(enumOf(type));
+            }
+        }
+        return enums;
+    }
+
+    /** {@code demo.Outer.Status} is mirrored by {@code demo.Outer_StatusCEnum}. */
+    static ClassName mirrorName(TypeElement javaEnum) {
+        PackageElement pkg = (PackageElement) packageOf(javaEnum);
+        return ClassName.get(pkg.getQualifiedName().toString(), flatName(javaEnum, ENUM_SUFFIX));
+    }
+
+    private static Element packageOf(Element element) {
+        while (!(element instanceof PackageElement)) {
+            element = element.getEnclosingElement();
+        }
+        return element;
+    }
+
+    /**
+     * The C header defining {@code cName} as a {@code typedef enum} whose constants, named by {@code constants}
+     * (Java constant to C constant), take the Java ordinals as values.
+     */
+    static String enumHeader(TypeElement javaEnum, String cName, Map<String, String> constants) {
+        String guard = "NATIVEBIND_" + CNames.upperSnake(cName) + "_H";
+        StringBuilder header = new StringBuilder()
+                .append("#ifndef ").append(guard).append('\n')
+                .append("#define ").append(guard).append('\n')
+                .append('\n')
+                .append("/* Mirrors ").append(javaEnum.getQualifiedName()).append(" */\n")
+                .append("typedef enum ").append(cName).append(" {\n");
+        int ordinal = 0;
+        for (String cConstant : constants.values()) {
+            header.append("    ").append(cConstant).append(" = ").append(ordinal).append(ordinal + 1 < constants.size() ? ",\n" : "\n");
+            ordinal++;
+        }
+        return header.append("} ").append(cName).append(";\n")
+                .append('\n')
+                .append("#endif\n")
+                .toString();
+    }
+
+    /**
+     * The {@code @CEnum} through which entry points pass {@code javaEnum} as the C enumeration {@code cName}. Its
+     * {@code @CContext} hands native-image the definition from {@link #enumHeader}, so the C values are the Java
+     * ordinals and the generated image header can name the type.
+     */
+    JavaFile generateEnum(TypeElement javaEnum, String cName, Map<String, String> constants) {
+        ClassName mirror = mirrorName(javaEnum);
+        ClassName directives = mirror.nestedClass("Directives");
+        TypeName javaType = ClassName.get(javaEnum);
+        String headerFile = ENUM_HEADER_DIRECTORY + cName + ".h";
+
+        TypeSpec.Builder clazz = TypeSpec.enumBuilder(mirror.simpleName())
+                .addModifiers(Modifier.PUBLIC)
+                .addOriginatingElement(javaEnum)
+                .addAnnotation(AnnotationSpec.builder(ClassName.get("javax.annotation.processing", "Generated"))
+                        .addMember("value", "$S", NativeBindProcessor.class.getName())
+                        .build())
+                .addAnnotation(AnnotationSpec.builder(C_CONTEXT).addMember("value", "$T.class", directives).build())
+                .addAnnotation(AnnotationSpec.builder(C_ENUM).addMember("value", "$S", cName).build())
+                .addJavadoc("The C enumeration {@code $L}, through which NativeBind entry points pass {@link $T}.\n", cName, javaType)
+                .addJavadoc("<p>\n")
+                .addJavadoc("Its definition, {@link #HEADER}, is written to {@code $L.h} beside the image headers, which include it,\n", cName)
+                .addJavadoc("by {@code $L}. It is also the {@code $L} resource.\n", FEATURE_CLASS, headerFile);
+        constants.forEach((javaConstant, cConstant) -> clazz.addEnumConstant(javaConstant, TypeSpec.anonymousClassBuilder("")
+                .addAnnotation(AnnotationSpec.builder(C_ENUM_CONSTANT).addMember("value", "$S", cConstant).build())
+                .build()));
+
+        ArrayTypeName javaArray = ArrayTypeName.of(javaType);
+        ArrayTypeName mirrorArray = ArrayTypeName.of(mirror);
+        clazz.addField(FieldSpec.builder(String.class, "HEADER", Modifier.PUBLIC, Modifier.STATIC, Modifier.FINAL)
+                        .addJavadoc("The C definition of {@code $L}.\n", cName)
+                        .initializer("$S", enumHeader(javaEnum, cName, constants))
+                        .build())
+                .addField(FieldSpec.builder(javaArray, "JAVA", Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+                        .initializer("$T.values()", javaType)
+                        .build())
+                .addField(FieldSpec.builder(mirrorArray, "MIRRORS", Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL)
+                        .initializer("values()")
+                        .build())
+                .addMethod(MethodSpec.methodBuilder("toC")
+                        .addJavadoc("This constant's C value.\n")
+                        .addModifiers(Modifier.PUBLIC, Modifier.NATIVE)
+                        .addAnnotation(C_ENUM_VALUE)
+                        .returns(int.class)
+                        .build())
+                .addMethod(MethodSpec.methodBuilder("fromC")
+                        .addJavadoc("The constant with the given C value, or null if there is none.\n")
+                        .addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.NATIVE)
+                        .addAnnotation(C_ENUM_LOOKUP)
+                        .returns(mirror)
+                        .addParameter(int.class, "value")
+                        .build())
+                .addMethod(MethodSpec.methodBuilder("toJava")
+                        .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                        .returns(javaType)
+                        .addParameter(mirror, "value")
+                        .addStatement("return value == null ? null : JAVA[value.ordinal()]")
+                        .build())
+                .addMethod(MethodSpec.methodBuilder("fromJava")
+                        .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
+                        .returns(mirror)
+                        .addParameter(javaType, "value")
+                        .addStatement("return value == null ? null : MIRRORS[value.ordinal()]")
+                        .build())
+                .addType(TypeSpec.classBuilder(directives.simpleName())
+                        .addJavadoc("Hands native-image {@link #HEADER} as a header file, as it only reads C definitions from files.\n")
+                        .addModifiers(Modifier.PUBLIC, Modifier.STATIC, Modifier.FINAL)
+                        .addSuperinterface(C_CONTEXT_DIRECTIVES)
+                        .addMethod(MethodSpec.methodBuilder("getHeaderFiles")
+                                .addAnnotation(Override.class)
+                                .addModifiers(Modifier.PUBLIC)
+                                .returns(ParameterizedTypeName.get(List.class, String.class))
+                                .beginControlFlow("try")
+                                .addStatement("$T header = $T.createTempFile($S, $S)", Path.class, Files.class, "nativebind-" + cName + "-", ".h")
+                                .addStatement("header.toFile().deleteOnExit()")
+                                .addStatement("$T.writeString(header, HEADER)", Files.class)
+                                // Forward slashes, since a backslash in an #include path is not portable
+                                .addStatement("return $T.of(\"\\\"\" + header.toAbsolutePath().toString().replace('\\\\', '/') + \"\\\"\")", List.class)
+                                .nextControlFlow("catch ($T e)", IOException.class)
+                                .addStatement("throw new $T(e)", UncheckedIOException.class)
+                                .endControlFlow()
+                                .build())
+                        .build());
+
+        return JavaFile.builder(mirror.packageName(), clazz.build()).skipJavaLangImports(true).build();
     }
 
     JavaFile generate(TypeElement owner, List<Entry> entries, String releaseHandleSymbol) {
@@ -153,7 +350,7 @@ final class CEntryPointGenerator {
             clazz.addMethod(wrapper(owner, generated, entry, releaseHandleSymbol, used, usedReturns, listeners));
         }
         if (!listeners.isEmpty()) {
-            addListeners(clazz, generated, listeners.values(), usedReturns);
+            addListeners(clazz, generated, listeners, usedReturns);
         }
         addHelpers(clazz, used, usedReturns);
 
@@ -205,6 +402,130 @@ final class CEntryPointGenerator {
 
         addBuiltins(clazz, packageName, symbols);
         addHelpers(clazz, EnumSet.of(Mapping.STRING, Mapping.HANDLE), EnumSet.of(Mapping.STRING, Mapping.HANDLE));
+        return JavaFile.builder(packageName, clazz.build()).skipJavaLangImports(true).build();
+    }
+
+    /** Where the classes {@link #FEATURE_CLASS} initializes at build time are listed, one binary name per line. */
+    static String buildTimeClassesResource(String packageName) {
+        return "META-INF/nativebind/" + (packageName.isEmpty() ? "default" : packageName) + "/build-time-classes";
+    }
+
+    static String featureProperties(String packageName) {
+        return "Args = --features=" + (packageName.isEmpty() ? "" : packageName + ".") + FEATURE_CLASS + "\n";
+    }
+
+    /**
+     * Initializes each {@code @CEnum} mirror, and the enum its static initializer reads, at build time, where
+     * native-image initializes the mirror. Mirrors can be generated in any round, so their names are read from the
+     * {@link #buildTimeClassesResource} written once processing is over.
+     * <p>
+     * The image headers name each enumeration without defining it, so once they are written the feature writes
+     * {@code <type>.h} beside them and includes it from each header that uses the type.
+     */
+    JavaFile generateFeature(String packageName, Iterable<? extends Element> origins) {
+        TypeName classList = ParameterizedTypeName.get(ClassName.get(List.class), ParameterizedTypeName.get(ClassName.get(Class.class), WildcardTypeName.subtypeOf(Object.class)));
+        TypeName names = ParameterizedTypeName.get(Collection.class, String.class);
+        TypeSpec.Builder clazz = TypeSpec.classBuilder(FEATURE_CLASS)
+                .addModifiers(Modifier.PUBLIC, Modifier.FINAL)
+                .addAnnotation(AnnotationSpec.builder(ClassName.get("javax.annotation.processing", "Generated"))
+                        .addMember("value", "$S", NativeBindProcessor.class.getName())
+                        .build())
+                .addJavadoc("Initializes the enums NativeBind passes to C, and their {@code @CEnum} mirrors, at build time, and writes the\n")
+                .addJavadoc("C definitions of the mirrors beside the image headers, which include them. Enabled through the generated\n")
+                .addJavadoc("{@code native-image.properties}.\n")
+                .addSuperinterface(FEATURE)
+                .addField(FieldSpec.builder(classList, "mirrors", Modifier.PRIVATE, Modifier.FINAL)
+                        .initializer("new $T<>()", ArrayList.class)
+                        .build())
+                // Features are instantiated reflectively by native-image, so the class needs a public constructor
+                .addMethod(MethodSpec.constructorBuilder().addModifiers(Modifier.PUBLIC).build())
+                .addMethod(MethodSpec.methodBuilder("afterImageWrite")
+                        .addAnnotation(Override.class)
+                        .addModifiers(Modifier.PUBLIC)
+                        .addParameter(FEATURE.nestedClass("AfterImageWriteAccess"), "access")
+                        .addStatement("$T image = access.getImagePath()", Path.class)
+                        .beginControlFlow("if (image == null || mirrors.isEmpty())")
+                        .addStatement("return")
+                        .endControlFlow()
+                        // native-image writes the headers into the directory of the library itself
+                        .addStatement("$T directory = image.toAbsolutePath().getParent()", Path.class)
+                        .beginControlFlow("try")
+                        .addStatement("$T<String, String> headers = new $T<>()", Map.class, LinkedHashMap.class)
+                        .beginControlFlow("for (Class<?> mirror : mirrors)")
+                        .addStatement("headers.put(mirror.getAnnotation($T.class).value(), (String) mirror.getField($S).get(null))", C_ENUM, "HEADER")
+                        .endControlFlow()
+                        .beginControlFlow("for ($T<String, String> header : headers.entrySet())", Map.Entry.class)
+                        .addStatement("$T.writeString(directory.resolve(header.getKey() + $S), header.getValue())", Files.class, ".h")
+                        .endControlFlow()
+                        .addStatement("$T<$T> files", List.class, Path.class)
+                        .beginControlFlow("try ($T<$T> listing = $T.list(directory))", Stream.class, Path.class, Files.class)
+                        .addStatement("files = listing.filter(file -> file.getFileName().toString().endsWith($S)).toList()", ".h")
+                        .endControlFlow()
+                        .beginControlFlow("for ($T file : files)", Path.class)
+                        .addStatement("String name = file.getFileName().toString()")
+                        .beginControlFlow("if (headers.containsKey(name.substring(0, name.length() - 2)))")
+                        .addStatement("continue")
+                        .endControlFlow()
+                        .addStatement("String content = $T.readString(file)", Files.class)
+                        .addStatement("String updated = includeEnums(content, headers.keySet())")
+                        .beginControlFlow("if (!updated.equals(content))")
+                        .addStatement("$T.writeString(file, updated)", Files.class)
+                        .endControlFlow()
+                        .endControlFlow()
+                        .nextControlFlow("catch ($T | $T e)", IOException.class, ReflectiveOperationException.class)
+                        .addStatement("throw new $T($S, e)", IllegalStateException.class, "NativeBind could not write the C enumeration headers")
+                        .endControlFlow()
+                        .build())
+                .addMethod(MethodSpec.methodBuilder("includeEnums")
+                        .addJavadoc("Includes {@code <type>.h} for each of {@code types} that {@code header} uses and does not include yet, right\n")
+                        .addJavadoc("after its include guard so that the definitions precede every use.\n")
+                        .addModifiers(Modifier.STATIC)
+                        .returns(String.class)
+                        .addParameter(String.class, "header")
+                        .addParameter(names, "types")
+                        .addStatement("StringBuilder includes = new StringBuilder()")
+                        .beginControlFlow("for (String type : types)")
+                        .addStatement("String include = $S + type + $S", "#include \"", ".h\"")
+                        .beginControlFlow("if (!header.contains(include) && $T.compile($S + type + $S).matcher(header).find())", Pattern.class, "\\b", "\\b")
+                        .addStatement("includes.append(include).append('\\n')")
+                        .endControlFlow()
+                        .endControlFlow()
+                        .beginControlFlow("if (includes.length() == 0)")
+                        .addStatement("return header")
+                        .endControlFlow()
+                        .addStatement("$T guard = $T.compile($S).matcher(header)", Matcher.class, Pattern.class, "(?m)^#define [A-Za-z0-9_]+[ \\t]*\\r?\\n")
+                        .addStatement("int at = guard.find() ? guard.end() : 0")
+                        .addStatement("return header.substring(0, at) + includes + header.substring(at)")
+                        .build())
+                .addMethod(MethodSpec.methodBuilder("afterRegistration")
+                        .addAnnotation(Override.class)
+                        .addModifiers(Modifier.PUBLIC)
+                        .addParameter(FEATURE.nestedClass("AfterRegistrationAccess"), "access")
+                        .beginControlFlow("try")
+                        .addStatement("$T<$T> lists = access.getApplicationClassLoader().getResources($S)",
+                                Enumeration.class, URL.class, buildTimeClassesResource(packageName))
+                        .beginControlFlow("while (lists.hasMoreElements())")
+                        .beginControlFlow("try ($T in = lists.nextElement().openStream())", InputStream.class)
+                        .beginControlFlow("for (String name : new String(in.readAllBytes(), $T.UTF_8).split($S))", StandardCharsets.class, "\n")
+                        .beginControlFlow("if (name.isBlank())")
+                        .addStatement("continue")
+                        .endControlFlow()
+                        .addStatement("Class<?> type = access.findClassByName(name.strip())")
+                        .beginControlFlow("if (type == null)")
+                        .addStatement("throw new $T($S + name.strip())", IllegalStateException.class, "NativeBind could not find ")
+                        .endControlFlow()
+                        .addStatement("$T.initializeAtBuildTime(type)", RUNTIME_CLASS_INITIALIZATION)
+                        .beginControlFlow("if (type.isAnnotationPresent($T.class))", C_ENUM)
+                        .addStatement("mirrors.add(type)")
+                        .endControlFlow()
+                        .endControlFlow()
+                        .endControlFlow()
+                        .endControlFlow()
+                        .nextControlFlow("catch ($T e)", IOException.class)
+                        .addStatement("throw new $T(e)", UncheckedIOException.class)
+                        .endControlFlow()
+                        .build());
+        origins.forEach(clazz::addOriginatingElement);
         return JavaFile.builder(packageName, clazz.build()).skipJavaLangImports(true).build();
     }
 
@@ -305,11 +626,16 @@ final class CEntryPointGenerator {
 
     /** {@code Outer.Inner} becomes {@code Outer_InnerCEntryPoints}. */
     static String generatedSimpleName(TypeElement owner) {
-        StringBuilder name = new StringBuilder(owner.getSimpleName());
-        for (Element e = owner.getEnclosingElement(); e instanceof TypeElement t; e = t.getEnclosingElement()) {
+        return flatName(owner, CLASS_SUFFIX);
+    }
+
+    /** {@code Outer.Inner} becomes {@code Outer_Inner} followed by {@code suffix}. */
+    static String flatName(TypeElement type, String suffix) {
+        StringBuilder name = new StringBuilder(type.getSimpleName());
+        for (Element e = type.getEnclosingElement(); e instanceof TypeElement t; e = t.getEnclosingElement()) {
             name.insert(0, t.getSimpleName() + "_");
         }
-        return name.append(CLASS_SUFFIX).toString();
+        return name.append(suffix).toString();
     }
 
     private MethodSpec wrapper(TypeElement owner, ClassName generated, Entry entry, String releaseHandleSymbol,
@@ -330,7 +656,7 @@ final class CEntryPointGenerator {
         String javaName = SourceVersion.isKeyword(entry.symbol()) ? entry.symbol() + "_" : entry.symbol();
         MethodSpec.Builder builder = MethodSpec.methodBuilder(javaName)
                 .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
-                .returns(returnMapping.cType(returnType))
+                .returns(cType(returnMapping, returnType))
                 .addParameter(ParameterSpec.builder(ISOLATE_THREAD, threadParam)
                         .addAnnotation(ISOLATE_THREAD_CONTEXT)
                         .build());
@@ -341,14 +667,14 @@ final class CEntryPointGenerator {
 
         List<CodeBlock> args = new ArrayList<>();
         List<String> listenerDocs = new ArrayList<>();
+        List<String> enumDocs = new ArrayList<>();
         for (VariableElement p : member.parameters()) {
             TypeMirror type = p.asType();
             String name = p.getSimpleName().toString();
             Listener listener = listenerOf(type);
             if (listener != null) {
                 // A Consumer arrives as a callback, the user data handed back to it, and an optional release hook
-                String suffix = listener.suffix(types);
-                listeners.putIfAbsent(suffix, listener);
+                String suffix = Listener.register(listeners, listener, types);
                 String data = unique(name + "Data", taken);
                 String free = unique(name + "Free", taken);
                 builder.addParameter(generated.nestedClass(suffix + LISTENER), name)
@@ -360,16 +686,21 @@ final class CEntryPointGenerator {
             }
             Mapping mapping = mappingOf(type);
             usedParams.add(mapping);
-            builder.addParameter(mapping.cType(type), name);
+            builder.addParameter(cType(mapping, type), name);
             args.add(switch (mapping) {
                 case VOID, PASS_THROUGH -> CodeBlock.of("$N", name);
                 case STRING -> CodeBlock.of("$N($N)", TO_JAVA_STRING, name);
                 case HANDLE -> CodeBlock.of("($T) $N($N)", TypeName.get(types.erasure(type)), FROM_HANDLE, name);
+                case ENUM -> CodeBlock.of("$T.toJava($N)", mirrorName(enumOf(type)), name);
             });
+            if (mapping == Mapping.ENUM) {
+                enumDocs.add("A " + name + " outside its enumeration reaches the Java code as null.");
+            }
         }
         for (TypeMirror thrown : member.thrownTypes()) {
             builder.addException(TypeName.get(thrown));
         }
+        listenerDocs.addAll(enumDocs);
         builder.addAnnotation(entryPointAnnotation(entry, returnMapping, releaseHandleSymbol, listenerDocs));
 
         CodeBlock receiver = selfParam == null
@@ -382,6 +713,7 @@ final class CEntryPointGenerator {
             case PASS_THROUGH -> builder.addStatement("return $L", call);
             case STRING -> builder.addStatement("return $N($L)", TO_C_STRING, call);
             case HANDLE -> builder.addStatement("return $N($L)", TO_HANDLE, call);
+            case ENUM -> builder.addStatement("return $T.fromJava($L)", mirrorName(enumOf(returnType)), call);
         }
         return builder.build();
     }
@@ -414,6 +746,8 @@ final class CEntryPointGenerator {
             lines.add("The returned string is allocated with malloc and must be released by the caller with free().");
         } else if (returnMapping == Mapping.HANDLE) {
             lines.add("The returned handle keeps its object alive until it is passed to " + releaseHandleSymbol + "().");
+        } else if (returnMapping == Mapping.ENUM) {
+            lines.add("A null result from the Java code cannot be represented and fails the call.");
         }
         return lines;
     }
@@ -425,6 +759,7 @@ final class CEntryPointGenerator {
             case STRING -> "The string value is only valid until " + name + " returns.";
             case HANDLE -> "The handle value is only valid until " + name + " returns, and must not be released.";
             case BOXED -> "A null value arrives as " + (listener.primitive(types) == TypeKind.BOOLEAN ? "false." : "0.");
+            case ENUM -> "A null value has no C enumeration constant, so notifying it throws a NullPointerException in the Java code.";
         });
         lines.add("If " + free + " is not NULL, it is called with " + data + " once the Java code no longer holds the listener, which may be never.");
         return lines;
@@ -438,7 +773,7 @@ final class CEntryPointGenerator {
      * Declares the callback type and {@code Consumer} factory for each kind of listener the wrappers take, and the
      * hook that releases a listener's user data once its {@code Consumer} is unreachable.
      */
-    private void addListeners(TypeSpec.Builder clazz, ClassName generated, Collection<Listener> listeners, Set<Mapping> usedReturns) {
+    private void addListeners(TypeSpec.Builder clazz, ClassName generated, Map<String, Listener> listeners, Set<Mapping> usedReturns) {
         ClassName free = generated.nestedClass(LISTENER_FREE);
         clazz.addType(TypeSpec.interfaceBuilder(LISTENER_FREE)
                 .addModifiers(Modifier.PUBLIC)
@@ -464,13 +799,16 @@ final class CEntryPointGenerator {
                 .endControlFlow()
                 .build());
 
-        for (Listener listener : listeners) {
-            String suffix = listener.suffix(types);
+        for (Map.Entry<String, Listener> registered : listeners.entrySet()) {
+            String suffix = registered.getKey();
+            Listener listener = registered.getValue();
             ClassName callback = generated.nestedClass(suffix + LISTENER);
             TypeName cValue = switch (listener.kind()) {
                 case STRING -> C_CHAR_POINTER;
                 case BOXED -> TypeName.get(types.getPrimitiveType(listener.primitive(types)));
                 case HANDLE -> OBJECT_HANDLE;
+                // The @CEnum mirror, or the enum itself if it is a @CEnum, which native-image converts in the call
+                case ENUM -> cType(mappingOf(listener.valueType()), listener.valueType());
             };
             clazz.addType(TypeSpec.interfaceBuilder(callback.simpleName())
                     .addModifiers(Modifier.PUBLIC)
@@ -500,6 +838,13 @@ final class CEntryPointGenerator {
                             .endControlFlow();
                 }
                 case BOXED -> notify.addStatement("$L", invokeListener(callback, Listener.unboxedOrZero(listener.primitive(types), "value")));
+                case ENUM -> notify.beginControlFlow("if (value == null)")
+                        .addStatement("throw new $T($S)", NullPointerException.class,
+                                "null cannot be passed to a C listener of " + listener.enumType().getQualifiedName())
+                        .endControlFlow()
+                        .addStatement("$L", invokeListener(callback, mappingOf(listener.valueType()) == Mapping.ENUM
+                                ? CodeBlock.of("$T.fromJava(value)", mirrorName(listener.enumType()))
+                                : CodeBlock.of("value")));
                 case HANDLE -> {
                     usedReturns.add(Mapping.HANDLE);
                     notify.addStatement("$T handle = $N(value)", OBJECT_HANDLE, TO_HANDLE)

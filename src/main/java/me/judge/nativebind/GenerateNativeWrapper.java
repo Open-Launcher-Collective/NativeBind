@@ -18,12 +18,23 @@ import java.lang.annotation.Target;
  *     <li>primitives and {@code org.graalvm.word.WordBase} subtypes are passed through unchanged</li>
  *     <li>{@link String} becomes {@code CCharPointer}; a returned string is {@code malloc}-ed and must be
  *     released by the caller with {@code free()}</li>
+ *     <li>an enum annotated with GraalVM's {@code @CEnum} is passed through, and native-image converts it</li>
+ *     <li>any other enum {@code Status} becomes a C enumeration through a generated {@code @CEnum} mirror,
+ *     {@code StatusCEnum} in the enum's package. The C type is the support prefix followed by the enum's name
+ *     ({@code judgeLibStatus}), each constant is that name in upper snake case followed by the constant's
+ *     ({@code JUDGE_LIB_STATUS_OK}), and its value is the constant's ordinal. A value outside the enumeration arrives as
+ *     null, and returning null fails the call. The generated {@code NativeBindCFeature} (enabled by a generated
+ *     {@code native-image.properties}) initializes the mirror and the enum at build time, where native-image needs the
+ *     mirror, and, once the image is written, writes {@code <type>.h} beside the image headers and includes it from each
+ *     one that uses the type, so that they compile on their own. The definition is also the mirror's {@code HEADER} and
+ *     the {@code META-INF/nativebind/include/<type>.h} resource</li>
  *     <li>any other reference type becomes an {@code ObjectHandle} from {@code ObjectHandles.getGlobal()}</li>
  *     <li>a {@code java.util.function.Consumer} parameter {@code listener} becomes three: a function pointer
  *     {@code void listener(graal_isolatethread_t *, value, void *userData)}, the {@code void *listenerData} passed back
  *     to it, and an optional {@code void listenerFree(void *userData)}. The Java code may call it any number of times,
  *     from any thread. Its value is a {@code const char *} for {@code String}, the primitive for a boxed type (null
- *     arriving as 0 or false), or else an {@code ObjectHandle}; strings and handles are only valid until the callback
+ *     arriving as 0 or false), the C enumeration for an enum (as for a parameter; notifying null throws a
+ *     {@code NullPointerException} in the Java code), or else an {@code ObjectHandle}; strings and handles are only valid until the callback
  *     returns. {@code listenerFree}, when not NULL, is called with the user data once the Java code no longer holds the
  *     listener, which may be never.</li>
  *     <li>for instance methods, the receiver is passed as a leading {@code ObjectHandle} parameter</li>
